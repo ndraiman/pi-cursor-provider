@@ -1,6 +1,6 @@
 {
   "name": "pi-cursor-provider",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pi extension providing access to Cursor models via OAuth and a local OpenAI-compatible gRPC proxy",
   "type": "module",
   "license": "MIT",
@@ -40,7 +40,9 @@
     "LICENSE"
   ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.0.0"
