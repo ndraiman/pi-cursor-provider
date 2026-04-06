@@ -8,6 +8,8 @@
  * Usage:
  *   /login cursor    — authenticate via browser
  *   /model           — select any Cursor model
+ *
+ * Based on https://github.com/ephraimduncan/opencode-cursor by Ephraim Duncan.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";

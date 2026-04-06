@@ -6,6 +6,8 @@
  * 2. Open browser to cursor.com/loginDeepControl
  * 3. Poll api2.cursor.sh/auth/poll until tokens arrive
  * 4. Refresh via api2.cursor.sh/auth/exchange_user_api_key
+ *
+ * Based on https://github.com/ephraimduncan/opencode-cursor by Ephraim Duncan.
  */
 
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";

@@ -1,7 +1,7 @@
 /**
  * Local OpenAI-compatible proxy: translates /v1/chat/completions to Cursor's gRPC protocol.
  *
- * Adapted from https://github.com/ephraimduncan/opencode-cursor
+ * Based on https://github.com/ephraimduncan/opencode-cursor by Ephraim Duncan.
  * Uses Node's http2 via a child process bridge (h2-bridge.mjs).
  */
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
