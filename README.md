@@ -97,6 +97,23 @@ To see all raw Cursor model variants without dedup:
 PI_CURSOR_RAW_MODELS=1 pi
 ```
 
+## Session Management
+
+The proxy maintains conversation state per pi session, enabling multi-turn conversations with Cursor models.
+
+### How it works
+
+- **Session tracking** — pi's session ID is injected into requests via a `before_provider_request` hook. The proxy uses it to maintain a stable conversation with Cursor across turns (checkpoint, blob store, conversation ID).
+- **Checkpoints** — Cursor returns a conversation checkpoint after each turn. The proxy stores it and sends it back on subsequent requests, so the model sees full conversation history without re-sending all messages.
+
+### Session fork
+
+When you navigate back in pi's session tree and branch from an earlier point, the proxy detects the fork (turn count mismatch vs checkpoint) and starts a fresh Cursor conversation. Since Cursor's internal turn structure can't be reliably truncated, the proxy inlines the conversation history as text in the user message so the model retains context from before the fork.
+
+### Session resume
+
+Conversation state is stored in memory. If the proxy restarts (pi restart), checkpoints are lost. On the next request, pi sends the full conversation history, which the proxy inlines as text — same as the fork path. The model sees the context but Cursor treats it as a new conversation.
+
 ## Requirements
 
 - [Pi](https://github.com/badlogic/pi-mono)
