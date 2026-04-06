@@ -1,6 +1,6 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
 import { describe, expect, test } from "bun:test";
-import { FALLBACK_MODELS, parseModelId, processModels, supportsReasoningModelId } from "./index.ts";
+import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, supportsReasoningModelId } from "./index.ts";
 import { resolveModelId } from "./proxy.ts";
 import type { CursorModel } from "./proxy.ts";
 
@@ -90,6 +90,40 @@ describe("parseModelId", () => {
   });
 });
 
+// ── buildEffortMap ──
+
+describe("buildEffortMap", () => {
+  test("full range: none/low/medium/high/xhigh", () => {
+    const map = buildEffortMap(new Set(["none", "low", "medium", "high", "xhigh"]));
+    expect(map).toEqual({ minimal: "none", low: "low", medium: "medium", high: "high", xhigh: "xhigh" });
+  });
+
+  test("with default (empty) and medium", () => {
+    const map = buildEffortMap(new Set(["", "low", "medium", "high"]));
+    expect(map).toEqual({ minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "high" });
+  });
+
+  test("default without medium — medium maps to empty", () => {
+    const map = buildEffortMap(new Set(["", "low", "high", "xhigh"]));
+    expect(map.medium).toBe("");
+  });
+
+  test("high+max only — all lower levels clamp to high", () => {
+    const map = buildEffortMap(new Set(["high", "max"]));
+    expect(map).toEqual({ minimal: "high", low: "high", medium: "high", high: "high", xhigh: "max" });
+  });
+
+  test("none+low+medium+high+max", () => {
+    const map = buildEffortMap(new Set(["none", "low", "medium", "high", "max"]));
+    expect(map).toEqual({ minimal: "none", low: "low", medium: "medium", high: "high", xhigh: "max" });
+  });
+
+  test("low+high — medium falls back to low", () => {
+    const map = buildEffortMap(new Set(["low", "high"]));
+    expect(map).toEqual({ minimal: "low", low: "low", medium: "low", high: "high", xhigh: "high" });
+  });
+});
+
 // ── processModels ──
 
 describe("reasoning support", () => {
@@ -161,33 +195,52 @@ describe("processModels", () => {
     expect(result[0].effortMap!.minimal).toBe("none");
   });
 
-  test("claude-4.6-opus — only high+max, no default/medium → NOT deduped", () => {
+  test("claude-4.6-opus — high+max deduped, effort clamped to lowest", () => {
     const result = processModels([
       m("claude-4.6-opus-high"), m("claude-4.6-opus-max"),
     ]);
-    expect(result).toHaveLength(2);
-    expect(result.every(r => r.supportsEffort === false)).toBe(true);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("claude-4.6-opus");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.minimal).toBe("high");
+    expect(result[0].effortMap!.low).toBe("high");
+    expect(result[0].effortMap!.medium).toBe("high");
+    expect(result[0].effortMap!.high).toBe("high");
+    expect(result[0].effortMap!.xhigh).toBe("max");
   });
 
-  test("claude-4.6-opus-thinking — only high+max thinking, NOT deduped", () => {
+  test("claude-4.6-opus-thinking — high+max thinking deduped", () => {
     const result = processModels([
       m("claude-4.6-opus-high-thinking"), m("claude-4.6-opus-max-thinking"),
     ]);
-    expect(result).toHaveLength(2);
-    expect(result.every(r => r.supportsEffort === false)).toBe(true);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("claude-4.6-opus-thinking");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.high).toBe("high");
+    expect(result[0].effortMap!.xhigh).toBe("max");
   });
 
-  test("claude-4.5-opus-high — single variant, NOT deduped", () => {
+  test("claude-4.5-opus-high — single effort variant, deduped to base", () => {
     const result = processModels([m("claude-4.5-opus-high")]);
     expect(result).toHaveLength(1);
-    expect(result[0].id).toBe("claude-4.5-opus-high");
-    expect(result[0].supportsEffort).toBe(false);
+    expect(result[0].id).toBe("claude-4.5-opus");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.high).toBe("high");
+    expect(result[0].effortMap!.minimal).toBe("high");
   });
 
-  test("claude-4.6-sonnet-medium — single variant, NOT deduped", () => {
+  test("claude-4.6-sonnet-medium — single effort variant, deduped to base", () => {
     const result = processModels([m("claude-4.6-sonnet-medium")]);
     expect(result).toHaveLength(1);
-    expect(result[0].id).toBe("claude-4.6-sonnet-medium");
+    expect(result[0].id).toBe("claude-4.6-sonnet");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.medium).toBe("medium");
+  });
+
+  test("composer-2 — single model without effort, NOT deduped", () => {
+    const result = processModels([m("composer-2")]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("composer-2");
     expect(result[0].supportsEffort).toBe(false);
   });
 
@@ -241,7 +294,7 @@ describe("processModels", () => {
     const result = processModels(rawModels as CursorModel[]);
     // Should be significantly fewer than 83
     expect(result.length).toBeLessThan(50);
-    expect(result.length).toBeGreaterThan(30);
+    expect(result.length).toBeGreaterThan(20);
 
     // Spot checks
     const composer2 = result.find(r => r.id === "composer-2");
@@ -251,6 +304,13 @@ describe("processModels", () => {
     const gpt54 = result.find(r => r.id === "gpt-5.4");
     expect(gpt54).toBeDefined();
     expect(gpt54!.supportsEffort).toBe(true);
+
+    // Opus should be deduped too
+    const opus46 = result.find(r => r.id === "claude-4.6-opus");
+    expect(opus46).toBeDefined();
+    expect(opus46!.supportsEffort).toBe(true);
+    expect(result.find(r => r.id === "claude-4.6-opus-high")).toBeUndefined();
+    expect(result.find(r => r.id === "claude-4.6-opus-max")).toBeUndefined();
 
     // No raw effort IDs should leak through for deduped models
     expect(result.find(r => r.id === "gpt-5.4-medium")).toBeUndefined();

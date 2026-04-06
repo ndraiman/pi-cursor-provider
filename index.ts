@@ -137,6 +137,36 @@ export function supportsReasoningModelId(id: string): boolean {
   return /^(claude|composer|gemini|gpt|grok|kimi)(-|$)/i.test(base);
 }
 
+/**
+ * Ordered effort levels from lowest to highest.
+ * "" = default (no effort suffix in model ID).
+ */
+const EFFORT_ORDER = ["none", "low", "", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * Build a reasoning-effort map from the set of available effort suffixes.
+ * For each pi effort level (minimal/low/medium/high/xhigh), picks the closest
+ * available cursor effort, falling back to the lowest available.
+ */
+export function buildEffortMap(efforts: Set<string>): Record<string, string> {
+  const sorted = EFFORT_ORDER.filter(e => efforts.has(e));
+  if (sorted.length === 0) return {};
+  const lowest = sorted[0]!;
+
+  const pick = (...targets: string[]) => {
+    for (const t of targets) if (efforts.has(t)) return t;
+    return lowest;
+  };
+
+  return {
+    minimal: pick("none", "low", ""),
+    low:     pick("low", "none", ""),
+    medium:  pick("medium", "", "low"),
+    high:    pick("high", "medium", ""),
+    xhigh:   pick("max", "xhigh", "high"),
+  };
+}
+
 /** Dedup raw models: collapse effort variants into one entry with supportsReasoningEffort. */
 export function processModels(raw: CursorModel[]): ProcessedModel[] {
   // Group by (base, fast, thinking)
@@ -159,12 +189,13 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
   const result: ProcessedModel[] = [];
 
   for (const g of groups.values()) {
-    const hasDefault = g.efforts.has("");
-    const hasMedium = g.efforts.has("medium");
-    const shouldDedup = g.efforts.size >= 2 && (hasDefault || hasMedium);
-
-    if (shouldDedup) {
-      // Pick representative: prefer "medium" or default ("") for name
+    // Dedup when there are multiple effort variants, OR a single variant
+    // whose effort is non-empty (e.g. claude-4.5-opus-high — strip the
+    // mandatory effort suffix so the model appears as claude-4.5-opus
+    // with effort mapping).
+    const hasOnlyEffortVariants = g.efforts.size === 1 && !g.efforts.has("");
+    if (g.efforts.size >= 2 || hasOnlyEffortVariants) {
+      // Pick representative: prefer "medium" or default ("") for name/metadata
       const rep = g.efforts.get("medium") ?? g.efforts.get("") ?? [...g.efforts.values()][0]!;
 
       // Build deduped model ID: base + thinking/fast suffix (no effort)
@@ -172,18 +203,11 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
       if (g.thinking) id += "-thinking";
       if (g.fast) id += "-fast";
 
-      const efforts = new Set(g.efforts.keys());
-      const effortMap: Record<string, string> = {
-        minimal: efforts.has("none") ? "none" : "low",
-        low: "low",
-        medium: hasMedium ? "medium" : "",
-        high: "high",
-        xhigh: efforts.has("max") ? "max" : "xhigh",
-      };
+      const effortMap = buildEffortMap(new Set(g.efforts.keys()));
 
       result.push({ ...rep, id, supportsEffort: true, effortMap });
     } else {
-      // Keep all entries as-is
+      // Keep single entries as-is (base model without effort variants)
       for (const model of g.efforts.values()) {
         result.push({ ...model, supportsEffort: false });
       }
