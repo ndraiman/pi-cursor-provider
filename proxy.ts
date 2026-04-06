@@ -301,19 +301,6 @@ export interface CursorModel {
   maxTokens: number;
 }
 
-const FALLBACK_MODELS: CursorModel[] = [
-  { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
-  { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
-  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
-];
-
 let cachedModels: CursorModel[] | null = null;
 
 export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
@@ -349,9 +336,8 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
   } catch (err) {
     console.error("[cursor-provider] Model discovery failed:", err instanceof Error ? err.message : err);
   }
-  console.warn("[cursor-provider] Using fallback model list");
-  cachedModels = FALLBACK_MODELS;
-  return FALLBACK_MODELS;
+  console.warn("[cursor-provider] Model discovery returned no models");
+  return [];
 }
 
 function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
@@ -478,20 +464,25 @@ function evictStaleConversations(): void {
 }
 
 /**
- * Append reasoning effort as a Cursor model ID suffix.
- * e.g. model="claude-4.6-opus" + reasoning_effort="high" → "claude-4.6-opus-high"
- * If the model already has a suffix or no effort is specified, return as-is.
+ * Insert reasoning effort into model ID, before -fast/-thinking suffix.
+ * e.g. model="gpt-5.4" + effort="medium" → "gpt-5.4-medium"
+ *      model="gpt-5.4-fast" + effort="high" → "gpt-5.4-high-fast"
+ * If no effort provided, returns model as-is.
  */
-const EFFORT_SUFFIXES = new Set(["low", "medium", "high"]);
-
-function resolveModelId(model: string, reasoningEffort?: string): string {
+export function resolveModelId(model: string, reasoningEffort?: string): string {
   if (!reasoningEffort) return model;
-  const effort = reasoningEffort.toLowerCase();
-  if (!EFFORT_SUFFIXES.has(effort)) return model;
-  // Don't double-append if model already ends with a known suffix
-  const lastPart = model.split("-").pop();
-  if (lastPart && EFFORT_SUFFIXES.has(lastPart)) return model;
-  return `${model}-${effort}`;
+
+  let suffix = "";
+  let base = model;
+  if (base.endsWith("-fast")) {
+    suffix = "-fast";
+    base = base.slice(0, -5);
+  } else if (base.endsWith("-thinking")) {
+    suffix = "-thinking";
+    base = base.slice(0, -9);
+  }
+
+  return `${base}-${reasoningEffort}${suffix}`;
 }
 
 async function handleChatCompletion(

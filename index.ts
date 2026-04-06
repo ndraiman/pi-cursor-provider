@@ -87,30 +87,105 @@ function estimateModelCost(modelId: string): ModelCost {
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
 }
 
-const EFFORT_SUFFIXES = new Set(["low", "medium", "high"]);
 
-/** Strip trailing -low/-medium/-high from a Cursor model ID. */
-function stripEffortSuffix(id: string): string {
-  const lastDash = id.lastIndexOf("-");
-  if (lastDash < 0) return id;
-  const suffix = id.slice(lastDash + 1);
-  return EFFORT_SUFFIXES.has(suffix) ? id.slice(0, lastDash) : id;
+// ── Effort-level dedup ──
+
+const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max", "none"]);
+
+interface ParsedModelId {
+  base: string;       // model ID with effort stripped
+  effort: string;     // effort level, or "" if no effort suffix
+  fast: boolean;      // has -fast suffix
+  thinking: boolean;  // has -thinking suffix
 }
 
-/** Deduplicate models by stripping effort suffixes, keeping highest context/maxTokens. */
-function dedupeModels(models: CursorModel[]): CursorModel[] {
-  const byBase = new Map<string, CursorModel>();
-  for (const m of models) {
-    const baseId = stripEffortSuffix(m.id);
-    const existing = byBase.get(baseId);
-    if (!existing || m.contextWindow > existing.contextWindow || m.maxTokens > existing.maxTokens) {
-      byBase.set(baseId, { ...m, id: baseId });
+export function parseModelId(id: string): ParsedModelId {
+  let remaining = id;
+  let fast = false;
+  let thinking = false;
+
+  if (remaining.endsWith("-fast")) {
+    fast = true;
+    remaining = remaining.slice(0, -5);
+  }
+  if (remaining.endsWith("-thinking")) {
+    thinking = true;
+    remaining = remaining.slice(0, -9);
+  }
+
+  const lastDash = remaining.lastIndexOf("-");
+  if (lastDash >= 0) {
+    const suffix = remaining.slice(lastDash + 1);
+    if (EFFORT_LEVELS.has(suffix)) {
+      return { base: remaining.slice(0, lastDash), effort: suffix, fast, thinking };
     }
   }
-  return [...byBase.values()].sort((a, b) => a.id.localeCompare(b.id));
+
+  return { base: remaining, effort: "", fast, thinking };
 }
 
-function modelConfig(m: CursorModel) {
+interface ProcessedModel extends CursorModel {
+  supportsEffort: boolean;
+  effortMap?: Record<string, string>;
+}
+
+/** Dedup raw models: collapse effort variants into one entry with supportsReasoningEffort. */
+export function processModels(raw: CursorModel[]): ProcessedModel[] {
+  // Group by (base, fast, thinking)
+  const groups = new Map<string, {
+    base: string; fast: boolean; thinking: boolean;
+    efforts: Map<string, CursorModel>;
+  }>();
+
+  for (const model of raw) {
+    const p = parseModelId(model.id);
+    const key = `${p.base}|${p.fast}|${p.thinking}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { base: p.base, fast: p.fast, thinking: p.thinking, efforts: new Map() };
+      groups.set(key, g);
+    }
+    g.efforts.set(p.effort, model);
+  }
+
+  const result: ProcessedModel[] = [];
+
+  for (const g of groups.values()) {
+    const hasDefault = g.efforts.has("");
+    const hasMedium = g.efforts.has("medium");
+    const shouldDedup = g.efforts.size >= 2 && (hasDefault || hasMedium);
+
+    if (shouldDedup) {
+      // Pick representative: prefer "medium" or default ("") for name
+      const rep = g.efforts.get("medium") ?? g.efforts.get("") ?? [...g.efforts.values()][0]!;
+
+      // Build deduped model ID: base + thinking/fast suffix (no effort)
+      let id = g.base;
+      if (g.thinking) id += "-thinking";
+      if (g.fast) id += "-fast";
+
+      const efforts = new Set(g.efforts.keys());
+      const effortMap: Record<string, string> = {
+        minimal: efforts.has("none") ? "none" : "low",
+        low: "low",
+        medium: hasMedium ? "medium" : "",
+        high: "high",
+        xhigh: efforts.has("max") ? "max" : "xhigh",
+      };
+
+      result.push({ ...rep, id, supportsEffort: true, effortMap });
+    } else {
+      // Keep all entries as-is
+      for (const model of g.efforts.values()) {
+        result.push({ ...model, supportsEffort: false });
+      }
+    }
+  }
+
+  return result.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function modelConfig(m: ProcessedModel) {
   return {
     id: m.id,
     name: m.name,
@@ -121,47 +196,101 @@ function modelConfig(m: CursorModel) {
     maxTokens: m.maxTokens,
     compat: {
       supportsDeveloperRole: false,
-      supportsReasoningEffort: true,
-      reasoningEffortMap: {
-        minimal: "low",
-        low: "low",
-        medium: "medium",
-        high: "high",
-        xhigh: "high",
-      },
+      supportsReasoningEffort: m.supportsEffort,
+      ...(m.supportsEffort && m.effortMap && {
+        reasoningEffortMap: m.effortMap,
+      }),
       maxTokensField: "max_tokens" as const,
     },
   };
 }
 
-// ── Fallback models (shown before model discovery) ──
+
+// ── Fallback models (from Cursor API, updated on login/refresh) ──
 
 const FALLBACK_MODELS: CursorModel[] = [
-  // Cursor
+  { id: "claude-4-sonnet", name: "Sonnet 4", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4-sonnet-1m", name: "Sonnet 4 1M", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4-sonnet-1m-thinking", name: "Sonnet 4 1M Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4-sonnet-thinking", name: "Sonnet 4 Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-opus-high", name: "Opus 4.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-opus-high-thinking", name: "Opus 4.5 Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-sonnet", name: "Sonnet 4.5 1M", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-sonnet-thinking", name: "Sonnet 4.5 1M Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-opus-high", name: "Opus 4.6 1M", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-opus-high-thinking", name: "Opus 4.6 1M Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-opus-max", name: "Opus 4.6 1M Max", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-opus-max-thinking", name: "Opus 4.6 1M Max Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-sonnet-medium", name: "Sonnet 4.6 1M", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-sonnet-medium-thinking", name: "Sonnet 4.6 1M Thinking", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-2-fast", name: "Composer 2 Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  // Anthropic
-  { id: "claude-4.6-opus", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
-  { id: "claude-4.6-sonnet", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4.5-haiku", name: "Claude 4.5 Haiku", reasoning: true, contextWindow: 200_000, maxTokens: 8_192 },
-  // OpenAI
-  { id: "gpt-5.4", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
-  { id: "gpt-5.4-mini", name: "GPT-5.4 Mini", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5", name: "GPT-5", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
-  { id: "gpt-5-mini", name: "GPT-5 Mini", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
-  // Google
-  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
-  { id: "gemini-3-pro", name: "Gemini 3 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "default", name: "Auto", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "gemini-3-flash", name: "Gemini 3 Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
-  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
-  // xAI
-  { id: "grok-4.20", name: "Grok 4.20", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
-  // Moonshot
+  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "gpt-5-mini", name: "GPT-5 Mini", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.1", name: "GPT-5.1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-high", name: "GPT-5.1 Codex Max High", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-high-fast", name: "GPT-5.1 Codex Max High Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-low", name: "GPT-5.1 Codex Max Low", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-low-fast", name: "GPT-5.1 Codex Max Low Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-medium", name: "GPT-5.1 Codex Max", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-medium-fast", name: "GPT-5.1 Codex Max Medium Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-xhigh", name: "GPT-5.1 Codex Max Extra High", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-max-xhigh-fast", name: "GPT-5.1 Codex Max Extra High Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-mini-high", name: "GPT-5.1 Codex Mini High", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-codex-mini-low", name: "GPT-5.1 Codex Mini Low", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-high", name: "GPT-5.1 High", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.1-low", name: "GPT-5.1 Low", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex-fast", name: "GPT-5.2 Codex Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex-high", name: "GPT-5.2 Codex High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex-high-fast", name: "GPT-5.2 Codex High Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex-low", name: "GPT-5.2 Codex Low", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex-low-fast", name: "GPT-5.2 Codex Low Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex-xhigh", name: "GPT-5.2 Codex Extra High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex-xhigh-fast", name: "GPT-5.2 Codex Extra High Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-fast", name: "GPT-5.2 Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-high", name: "GPT-5.2 High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-high-fast", name: "GPT-5.2 High Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-low", name: "GPT-5.2 Low", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-low-fast", name: "GPT-5.2 Low Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-xhigh", name: "GPT-5.2 Extra High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-xhigh-fast", name: "GPT-5.2 Extra High Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-fast", name: "GPT-5.3 Codex Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-high", name: "GPT-5.3 Codex High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-high-fast", name: "GPT-5.3 Codex High Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-low", name: "GPT-5.3 Codex Low", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-low-fast", name: "GPT-5.3 Codex Low Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-spark-preview", name: "GPT-5.3 Codex Spark", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-spark-preview-high", name: "GPT-5.3 Codex Spark High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-spark-preview-low", name: "GPT-5.3 Codex Spark Low", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-spark-preview-xhigh", name: "GPT-5.3 Codex Spark Extra High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-xhigh", name: "GPT-5.3 Codex Extra High", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex-xhigh-fast", name: "GPT-5.3 Codex Extra High Fast", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-high", name: "GPT-5.4 1M High", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-high-fast", name: "GPT-5.4 High Fast", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-low", name: "GPT-5.4 1M Low", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-medium", name: "GPT-5.4 1M", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-medium-fast", name: "GPT-5.4 Fast", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-mini-high", name: "GPT-5.4 Mini High", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-mini-low", name: "GPT-5.4 Mini Low", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-mini-medium", name: "GPT-5.4 Mini", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-mini-none", name: "GPT-5.4 Mini None", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-mini-xhigh", name: "GPT-5.4 Mini Extra High", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-nano-high", name: "GPT-5.4 Nano High", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-nano-low", name: "GPT-5.4 Nano Low", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-nano-medium", name: "GPT-5.4 Nano", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-nano-none", name: "GPT-5.4 Nano None", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-nano-xhigh", name: "GPT-5.4 Nano Extra High", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-xhigh", name: "GPT-5.4 1M Extra High", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-xhigh-fast", name: "GPT-5.4 Extra High Fast", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "grok-4-20", name: "Grok 4.20", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "grok-4-20-thinking", name: "Grok 4.20 Thinking", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
   { id: "kimi-k2.5", name: "Kimi K2.5", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
 ];
 
@@ -178,25 +307,21 @@ export default function (pi: ExtensionAPI) {
     return currentToken;
   });
 
-  // We don't have the port yet (async), so register with fallback models first.
-  // Once the proxy is ready, re-register with the real baseUrl.
+  // Register with fallback models immediately so they appear in /model
+  register(pi, 0, FALLBACK_MODELS);
   proxyReady.then((port) => {
     register(pi, port, FALLBACK_MODELS);
-  }).catch(() => {
-    // Proxy failed to start — models will show but requests will fail with a clear error
-  });
+  }).catch(() => {});
 
-  // Initial registration with placeholder baseUrl so models appear immediately
-  register(pi, 0, FALLBACK_MODELS);
-
-  function register(pi: ExtensionAPI, port: number, models: CursorModel[]) {
+  function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
     const baseUrl = port > 0 ? `http://127.0.0.1:${port}/v1` : "http://localhost:1";
+    const processed = processModels(rawModels);
 
     pi.registerProvider("cursor", {
       baseUrl,
       apiKey: "cursor-proxy",
       api: "openai-completions",
-      models: models.map(modelConfig),
+      models: processed.map(modelConfig),
       oauth: {
         name: "Cursor",
 
@@ -209,7 +334,7 @@ export default function (pi: ExtensionAPI) {
           // Discover real models and re-register
           const realPort = await proxyReady;
           const discovered = await getCursorModels(accessToken);
-          register(pi, realPort, dedupeModels(discovered));
+          if (discovered.length > 0) register(pi, realPort, discovered);
 
           return {
             refresh: refreshToken,
@@ -225,7 +350,7 @@ export default function (pi: ExtensionAPI) {
           // Discover real models on refresh too
           const realPort = await proxyReady;
           const discovered = await getCursorModels(refreshed.access);
-          register(pi, realPort, dedupeModels(discovered));
+          if (discovered.length > 0) register(pi, realPort, discovered);
 
           return refreshed;
         },
@@ -237,4 +362,6 @@ export default function (pi: ExtensionAPI) {
       },
     });
   }
+
+
 }

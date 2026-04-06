@@ -40,6 +40,51 @@ npm install
 /model            # select a Cursor model
 ```
 
+## Model Mapping
+
+Cursor exposes many model variants that encode **effort level** (`low`, `medium`, `high`, `xhigh`, `max`, `none`) and **speed** (`-fast`) or **thinking** (`-thinking`) in the model ID. This extension deduplicates them so pi's reasoning effort setting controls the effort level.
+
+### How it works
+
+Each raw Cursor model ID is parsed into components:
+
+```
+{base}-{effort}[-fast|-thinking]
+```
+
+Examples:
+
+| Raw Cursor ID | Base | Effort | Variant |
+|---|---|---|---|
+| `gpt-5.4-medium` | `gpt-5.4` | `medium` | — |
+| `gpt-5.4-high-fast` | `gpt-5.4` | `high` | `-fast` |
+| `claude-4.6-opus-max-thinking` | `claude-4.6-opus` | `max` | `-thinking` |
+| `gpt-5.1-codex-max-high` | `gpt-5.1-codex-max` | `high` | — |
+| `composer-2` | `composer-2` | — | — |
+
+Models sharing the same `(base, variant)` with **≥2 effort levels** and a sensible default (`medium` or no-suffix) are collapsed into a single entry with `supportsReasoningEffort: true`. Pi's thinking level maps to the effort suffix:
+
+| Pi Level | Cursor Suffix |
+|---|---|
+| `minimal` | `none` (if available) or `low` |
+| `low` | `low` |
+| `medium` | `medium` or no suffix (default) |
+| `high` | `high` |
+| `xhigh` | `max` (Claude) or `xhigh` (GPT) |
+
+The proxy inserts the effort before `-fast`/`-thinking`:
+
+```
+pi selects: gpt-5.4-fast  +  effort: high  →  Cursor receives: gpt-5.4-high-fast
+pi selects: gpt-5.4       +  effort: medium  →  Cursor receives: gpt-5.4-medium
+pi selects: composer-2     +  (no effort)     →  Cursor receives: composer-2
+```
+
+Models **not deduped** (kept as-is with effort baked into the ID):
+- Single effort variant (e.g., `claude-4.6-sonnet-medium`, `claude-4.5-opus-high`)
+- No default/medium variant (e.g., `claude-4.6-opus-high` / `claude-4.6-opus-max`)
+- No effort at all (e.g., `composer-2`, `gemini-3.1-pro`, `kimi-k2.5`)
+
 ## Requirements
 
 - [Pi](https://github.com/badlogic/pi-mono)
