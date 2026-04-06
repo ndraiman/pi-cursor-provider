@@ -1,6 +1,6 @@
 {
   "name": "pi-cursor-provider",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Pi extension providing access to Cursor models via OAuth and a local OpenAI-compatible gRPC proxy",
   "type": "module",
   "license": "MIT",
