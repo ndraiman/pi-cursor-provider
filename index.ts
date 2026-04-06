@@ -221,7 +221,7 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
 
 // ── Extension ──
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
   // Current access token, updated by login/refresh/getApiKey
   let currentToken = "";
 
@@ -234,21 +234,18 @@ export default function (pi: ExtensionAPI) {
 
   const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
 
-  // Register with fallback models immediately so they appear in /model
-  register(pi, 0, FALLBACK_MODELS);
-  proxyReady.then((port) => {
-    register(pi, port, FALLBACK_MODELS);
-  }).catch(() => {}); 
+  // Await proxy so models are registered before pi proceeds with model resolution.
+  const port = await proxyReady;
+  register(pi, port, FALLBACK_MODELS);
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
-    const baseUrl = port > 0 ? `http://127.0.0.1:${port}/v1` : "http://localhost:1";
+    const baseUrl = `http://127.0.0.1:${port}/v1`;
     const processed = skipDedup
       ? rawModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
       : processModels(rawModels);
 
     pi.registerProvider("cursor", {
       baseUrl,
-      apiKey: "cursor-proxy",
       api: "openai-completions",
       models: processed.map(modelConfig),
       oauth: {
