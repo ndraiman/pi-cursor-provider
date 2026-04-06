@@ -1,5 +1,6 @@
+import rawModels from "./cursor-models-raw.json" with { type: "json" };
 import { describe, expect, test } from "bun:test";
-import { parseModelId, processModels } from "./index.ts";
+import { FALLBACK_MODELS, parseModelId, processModels, supportsReasoningModelId } from "./index.ts";
 import { resolveModelId } from "./proxy.ts";
 import type { CursorModel } from "./proxy.ts";
 
@@ -90,6 +91,22 @@ describe("parseModelId", () => {
 });
 
 // ── processModels ──
+
+describe("reasoning support", () => {
+  test("derives reasoning from model ids", () => {
+    expect(supportsReasoningModelId("gpt-5.4")).toBe(true);
+    expect(supportsReasoningModelId("gpt-5.4-fast")).toBe(true);
+    expect(supportsReasoningModelId("composer-2")).toBe(true);
+    expect(supportsReasoningModelId("default")).toBe(true);
+    expect(supportsReasoningModelId("totally-unknown-model")).toBe(false);
+  });
+
+  test("fallback models keep derived reasoning enabled", () => {
+    expect(FALLBACK_MODELS.length).toBeGreaterThan(0);
+    expect(FALLBACK_MODELS.find((model) => model.id === "gpt-5.4-medium")?.reasoning).toBe(true);
+    expect(FALLBACK_MODELS.find((model) => model.id === "composer-2")?.reasoning).toBe(true);
+  });
+});
 
 describe("processModels", () => {
   test("composer-2 — no effort variants, kept as-is", () => {
@@ -221,8 +238,7 @@ describe("processModels", () => {
   });
 
   test("full raw model list dedup count", () => {
-    const raw: CursorModel[] = require("./cursor-models-raw.json");
-    const result = processModels(raw);
+    const result = processModels(rawModels as CursorModel[]);
     // Should be significantly fewer than 83
     expect(result.length).toBeLessThan(50);
     expect(result.length).toBeGreaterThan(30);
