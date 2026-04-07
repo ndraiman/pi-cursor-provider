@@ -15,6 +15,7 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
+  CancelActionSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
@@ -419,7 +420,7 @@ export async function startProxy(
           const parsed = JSON.parse(body) as ChatCompletionRequest;
           if (!proxyAccessTokenProvider) throw new Error("No access token provider");
           const accessToken = await proxyAccessTokenProvider();
-          await handleChatCompletion(parsed, accessToken, res);
+          await handleChatCompletion(parsed, accessToken, req, res);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -505,6 +506,7 @@ export function resolveModelId(model: string, reasoningEffort?: string): string 
 async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
@@ -526,7 +528,7 @@ async function handleChatCompletion(
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(bridgeKey);
     if (activeBridge.bridge.alive) {
-      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turnCount, res);
+      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turnCount, req, res);
       return;
     }
     clearInterval(activeBridge.heartbeatTimer);
@@ -567,9 +569,9 @@ async function handleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turnCount, res);
+    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turnCount, req, res);
   } else {
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turnCount, res);
+    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turnCount, req, res);
   }
 }
 
@@ -1097,10 +1099,36 @@ function handleStreamingResponse(
   bridgeKey: string,
   convKey: string,
   turnCount: number,
+  req: IncomingMessage,
   res: ServerResponse,
 ): void {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
-  writeSSEStream(bridge, heartbeatTimer, payload.blobStore, payload.mcpTools, modelId, bridgeKey, convKey, turnCount, res);
+  writeSSEStream(bridge, heartbeatTimer, payload.blobStore, payload.mcpTools, modelId, bridgeKey, convKey, turnCount, req, res);
+}
+
+function sendCancelAction(
+  bridge: ReturnType<typeof spawnBridge>,
+): void {
+  const action = create(ConversationActionSchema, {
+    action: { case: "cancelAction", value: create(CancelActionSchema, {}) },
+  });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "conversationAction", value: action },
+  });
+  bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+}
+
+function cleanupBridge(
+  bridge: ReturnType<typeof spawnBridge>,
+  heartbeatTimer: ReturnType<typeof setInterval>,
+  bridgeKey: string,
+): void {
+  clearInterval(heartbeatTimer);
+  if (bridge.alive) {
+    sendCancelAction(bridge);
+    bridge.end();
+  }
+  activeBridges.delete(bridgeKey);
 }
 
 function writeSSEStream(
@@ -1112,6 +1140,7 @@ function writeSSEStream(
   bridgeKey: string,
   convKey: string,
   turnCount: number,
+  req: IncomingMessage,
   res: ServerResponse,
 ): void {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -1155,6 +1184,17 @@ function writeSSEStream(
   const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
+  let cancelled = false;
+
+  // Detect client disconnect (e.g. user pressed Escape in pi)
+  const onClientClose = () => {
+    if (cancelled || closed) return;
+    cancelled = true;
+    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+    closeResponse();
+  };
+  req.on("close", onClientClose);
+  res.on("close", onClientClose);
 
   const processChunk = createConnectFrameParser(
     (messageBytes) => {
@@ -1227,11 +1267,14 @@ function writeSSEStream(
 
   bridge.onClose((code) => {
     clearInterval(heartbeatTimer);
+    req.removeListener("close", onClientClose);
+    res.removeListener("close", onClientClose);
     const stored = conversationStates.get(convKey);
     if (stored) {
       for (const [k, v] of blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
     }
+    if (cancelled) return;
     if (!mcpExecReceived) {
       const flushed = tagFilter.flush();
       if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1259,6 +1302,7 @@ function handleToolResultResume(
   bridgeKey: string,
   convKey: string,
   turnCount: number,
+  req: IncomingMessage,
   res: ServerResponse,
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
@@ -1294,7 +1338,7 @@ function handleToolResultResume(
     bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
   }
 
-  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount, res);
+  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount, req, res);
 }
 
 // ── Non-streaming response ──
@@ -1305,12 +1349,26 @@ async function handleNonStreamingResponse(
   modelId: string,
   convKey: string,
   turnCount: number,
+  req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+  let cancelled = false;
+
+  const onClientClose = () => {
+    if (cancelled) return;
+    cancelled = true;
+    clearInterval(heartbeatTimer);
+    if (bridge.alive) {
+      sendCancelAction(bridge);
+      bridge.end();
+    }
+  };
+  req.on("close", onClientClose);
+  res.on("close", onClientClose);
   const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
@@ -1356,10 +1414,21 @@ async function handleNonStreamingResponse(
 
     bridge.onClose(() => {
       clearInterval(heartbeatTimer);
+      req.removeListener("close", onClientClose);
+      res.removeListener("close", onClientClose);
       const stored = conversationStates.get(convKey);
       if (stored) {
         for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
         stored.lastAccessMs = Date.now();
+      }
+
+      if (cancelled) {
+        if (!res.headersSent) {
+          res.writeHead(499, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Client closed request", type: "aborted", code: "client_closed" } }));
+        }
+        resolve();
+        return;
       }
 
       if (nonStreamError) {
