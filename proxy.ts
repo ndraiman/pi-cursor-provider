@@ -777,6 +777,9 @@ function handleKvMessage(
     const blobId = (kvMsg as any).message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    if (!blobData) {
+      console.warn(`[cursor-provider] Blob not found: ${blobIdKey.slice(0, 16)}... (store has ${blobStore.size} blobs)`);
+    }
     sendKvResponse(kvMsg, "getBlobResult", create(GetBlobResultSchema, blobData ? { blobData } : {}), sendFrame);
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = (kvMsg as any).message.value;
@@ -1254,7 +1257,15 @@ function writeSSEStream(
       const endError = parseConnectEndStream(endStreamBytes);
       if (endError) {
         console.error(`[cursor-provider] Cursor stream error (${modelId}):`, endError.message);
-        conversationStates.delete(convKey);
+        // Invalidate checkpoint but preserve blob store so retries can still serve blobs.
+        // Previously this deleted the entire conversation state, causing "Blob not found"
+        // errors on subsequent requests (the server would request blobs that were lost).
+        const stored = conversationStates.get(convKey);
+        if (stored) {
+          stored.checkpoint = null;
+          stored.checkpointTurnCount = 0;
+          stored.conversationId = deterministicConversationId(`${convKey}:${Date.now()}`);
+        }
         sendSSE(makeChunk({ content: endError.message }, "error"));
         sendSSE(makeUsageChunk());
         sendDone();
@@ -1406,7 +1417,13 @@ async function handleNonStreamingResponse(
         const endError = parseConnectEndStream(endStreamBytes);
         if (endError) {
           console.error(`[cursor-provider] Cursor non-stream error (${modelId}):`, endError.message);
-          conversationStates.delete(convKey);
+          // Invalidate checkpoint but preserve blob store so retries can still serve blobs.
+          const stored = conversationStates.get(convKey);
+          if (stored) {
+            stored.checkpoint = null;
+            stored.checkpointTurnCount = 0;
+            stored.conversationId = deterministicConversationId(`${convKey}:${Date.now()}`);
+          }
           nonStreamError = endError;
         }
       },
