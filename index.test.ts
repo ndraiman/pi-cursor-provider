@@ -479,9 +479,12 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(decoded[1].steps[0].message.case).toBe("assistantMessage");
     expect((decoded[1].steps[0].message.value as any).text).toBe("second answer");
 
-    // Current message is the action, NOT inlined into turns
+    // Current message includes inlined history as text fallback
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("third question");
+    expect(userAction.userMessage.text).toContain("<conversation_history>");
+    expect(userAction.userMessage.text).toContain("first question");
+    expect(userAction.userMessage.text).toContain("first answer");
+    expect(userAction.userMessage.text).toEndWith("third question");
   });
 
   test("no checkpoint, turn with empty assistant — no steps", () => {
@@ -549,11 +552,12 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     expect(decoded[0].userMsg.text).toBe("first");
     expect((decoded[0].steps[0].message.value as any).text).toBe("response1");
 
-    // Current message is NOT inlined into turns
+    // Current message includes inlined history as text fallback
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("forked question");
-    // No XML conversation_history tags anywhere
-    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
+    expect(userAction.userMessage.text).toContain("<conversation_history>");
+    expect(userAction.userMessage.text).toContain("first");
+    expect(userAction.userMessage.text).toContain("response1");
+    expect(userAction.userMessage.text).toEndWith("forked question");
   });
 
   test("fork to beginning — no turns, no reconstruction", () => {

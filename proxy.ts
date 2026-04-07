@@ -547,6 +547,7 @@ async function handleChatCompletion(
   if (stored.checkpoint && turnCount !== stored.checkpointTurnCount) {
     stored.checkpoint = null;
     stored.checkpointTurnCount = 0;
+  } else {
   }
 
   const mcpTools = buildMcpToolDefinitions(tools);
@@ -710,6 +711,22 @@ export function buildCursorRequest(
       selfSummaryCount: 0,
       readPaths: [],
     });
+  }
+
+  // Reconstructed protobuf turns are accepted by the server but not used for model context.
+  // Inline conversation history as text in the user message as the reliable fallback.
+  if (!checkpoint && turns.length > 0) {
+    const lines: string[] = ["<conversation_history>"];
+    for (const turn of turns) {
+      lines.push(`<user>\n${turn.userText}\n</user>`);
+      if (turn.assistantText) {
+        lines.push(`<assistant>\n${turn.assistantText}\n</assistant>`);
+      }
+    }
+    lines.push("</conversation_history>");
+    lines.push("");
+    lines.push(userText);
+    userText = lines.join("\n");
   }
 
   const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
@@ -1178,6 +1195,10 @@ function writeSSEStream(
   let mcpExecReceived = false;
   let cancelled = false;
 
+  // Buffer checkpoint during stream — only commit on successful completion.
+  // Cancelled requests must not leave behind a checkpoint for a turn that never completed.
+  let pendingCheckpoint: Uint8Array | null = null;
+
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
     if (cancelled || closed) return;
@@ -1230,12 +1251,7 @@ function writeSSEStream(
             closeResponse();
           },
           (checkpointBytes) => {
-            const stored = conversationStates.get(convKey);
-            if (stored) {
-              stored.checkpoint = checkpointBytes;
-              stored.checkpointTurnCount = turnCount + 1;
-              stored.lastAccessMs = Date.now();
-            }
+            pendingCheckpoint = checkpointBytes;
           },
         );
       } catch (err) {
@@ -1265,6 +1281,12 @@ function writeSSEStream(
     if (stored) {
       for (const [k, v] of blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
+      // Commit checkpoint only on successful completion, not on cancel.
+      if (!cancelled && pendingCheckpoint) {
+        stored.checkpoint = pendingCheckpoint;
+        stored.checkpointTurnCount = turnCount + 1;
+      } else {
+      }
     }
     if (cancelled) return;
     if (!mcpExecReceived) {
@@ -1368,6 +1390,7 @@ async function handleNonStreamingResponse(
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
   let nonStreamError: Error | null = null;
+  let pendingCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
     bridge.onData(createConnectFrameParser(
@@ -1385,12 +1408,7 @@ async function handleNonStreamingResponse(
             },
             () => {},
             (checkpointBytes) => {
-              const stored = conversationStates.get(convKey);
-              if (stored) {
-                stored.checkpoint = checkpointBytes;
-                stored.checkpointTurnCount = turnCount + 1;
-                stored.lastAccessMs = Date.now();
-              }
+              pendingCheckpoint = checkpointBytes;
             },
           );
         } catch (err) {
@@ -1415,6 +1433,10 @@ async function handleNonStreamingResponse(
       if (stored) {
         for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
         stored.lastAccessMs = Date.now();
+        if (!cancelled && !nonStreamError && pendingCheckpoint) {
+          stored.checkpoint = pendingCheckpoint;
+          stored.checkpointTurnCount = turnCount + 1;
+        }
       }
 
       if (cancelled) {
