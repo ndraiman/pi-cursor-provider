@@ -138,6 +138,7 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
+  currentTurn: ParsedTurn;
 }
 
 export interface StoredConversation {
@@ -145,6 +146,7 @@ export interface StoredConversation {
   checkpoint: Uint8Array | null;
   /** Number of completed turns the checkpoint covers. */
   checkpointTurnCount: number;
+  checkpointHistoryFingerprint: string | null;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
 }
@@ -536,7 +538,6 @@ async function handleChatCompletion(
   }
 
   const sessionId = derivePiSessionId(body);
-  const turnCount = turns.length;
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
   const activeBridge = activeBridges.get(bridgeKey);
@@ -544,7 +545,7 @@ async function handleChatCompletion(
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(bridgeKey);
     if (activeBridge.bridge.alive) {
-      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turnCount, req, res);
+      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res);
       return;
     }
     clearInterval(activeBridge.heartbeatTimer);
@@ -563,6 +564,7 @@ async function handleChatCompletion(
       conversationId: deterministicConversationId(convKey),
       checkpoint: null,
       checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     };
@@ -571,12 +573,12 @@ async function handleChatCompletion(
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
-  // If incoming turn count doesn't match what the checkpoint covers (fork or divergence),
-  // discard the checkpoint. buildCursorRequest will reconstruct turns from the messages.
-  if (stored.checkpoint && turnCount !== stored.checkpointTurnCount) {
+  // Discard checkpoints whenever the completed-history fingerprint no longer matches.
+  // This covers both turn-count mismatches and same-depth branch switches.
+  if (shouldDiscardStoredCheckpoint(stored, turns)) {
     stored.checkpoint = null;
     stored.checkpointTurnCount = 0;
-  } else {
+    stored.checkpointHistoryFingerprint = null;
   }
 
   const mcpTools = buildMcpToolDefinitions(tools);
@@ -589,10 +591,15 @@ async function handleChatCompletion(
   );
   payload.mcpTools = mcpTools;
 
+  const currentTurn: ParsedTurn = {
+    userText: effectiveUserText,
+    steps: [],
+  };
+
   if (body.stream === false) {
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turnCount, req, res);
+    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res);
   } else {
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turnCount, req, res);
+    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res);
   }
 }
 
@@ -618,6 +625,59 @@ function parseToolCallArguments(raw: string): Record<string, unknown> {
 
 function isToolCallStep(step: ParsedTurnStep): step is ParsedToolCallStep {
   return step.kind === "toolCall";
+}
+
+function appendAssistantTextToTurn(turn: ParsedTurn, text: string): void {
+  if (!text) return;
+  const last = turn.steps.at(-1);
+  if (last?.kind === "assistantText") {
+    last.text += text;
+  } else {
+    turn.steps.push({ kind: "assistantText", text });
+  }
+}
+
+function canonicalizeFingerprintValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeFingerprintValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, inner]) => [key, canonicalizeFingerprintValue(inner)]),
+    );
+  }
+  return value;
+}
+
+export function buildCompletedHistoryFingerprint(turns: ParsedTurn[]): string {
+  const normalized = turns.map((turn) => ({
+    userText: turn.userText,
+    steps: turn.steps.map((step) => step.kind === "assistantText"
+      ? { kind: step.kind, text: step.text }
+      : {
+          kind: step.kind,
+          toolCallId: step.toolCallId,
+          toolName: step.toolName,
+          arguments: canonicalizeFingerprintValue(step.arguments),
+          result: step.result
+            ? {
+                content: step.result.content,
+                isError: step.result.isError,
+              }
+            : undefined,
+        }),
+  }));
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+export function shouldDiscardStoredCheckpoint(
+  stored: Pick<StoredConversation, "checkpoint" | "checkpointTurnCount" | "checkpointHistoryFingerprint">,
+  turns: ParsedTurn[],
+): boolean {
+  if (!stored.checkpoint) return false;
+  if (turns.length !== stored.checkpointTurnCount) return true;
+  const fingerprint = buildCompletedHistoryFingerprint(turns);
+  return stored.checkpointHistoryFingerprint !== fingerprint;
 }
 
 function stripTurnRuntimeState(turn: ParsedTurn & {
@@ -1271,12 +1331,25 @@ function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
-  turnCount: number,
+  completedTurns: ParsedTurn[],
+  currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
 ): void {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
-  writeSSEStream(bridge, heartbeatTimer, payload.blobStore, payload.mcpTools, modelId, bridgeKey, convKey, turnCount, req, res);
+  writeSSEStream(
+    bridge,
+    heartbeatTimer,
+    payload.blobStore,
+    payload.mcpTools,
+    modelId,
+    bridgeKey,
+    convKey,
+    completedTurns,
+    currentTurn,
+    req,
+    res,
+  );
 }
 
 function sendCancelAction(
@@ -1312,7 +1385,8 @@ function writeSSEStream(
   modelId: string,
   bridgeKey: string,
   convKey: string,
-  turnCount: number,
+  completedTurns: ParsedTurn[],
+  currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
 ): void {
@@ -1387,7 +1461,10 @@ function writeSSEStream(
             } else {
               const { content, reasoning } = tagFilter.process(text);
               if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
-              if (content) sendSSE(makeChunk({ content }));
+              if (content) {
+                appendAssistantTextToTurn(currentTurn, content);
+                sendSSE(makeChunk({ content }));
+              }
             }
           },
           (exec) => {
@@ -1396,7 +1473,17 @@ function writeSSEStream(
 
             const flushed = tagFilter.flush();
             if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+            if (flushed.content) {
+              appendAssistantTextToTurn(currentTurn, flushed.content);
+              sendSSE(makeChunk({ content: flushed.content }));
+            }
+
+            currentTurn.steps.push({
+              kind: "toolCall",
+              toolCallId: exec.toolCallId,
+              toolName: exec.toolName,
+              arguments: parseToolCallArguments(exec.decodedArgs),
+            });
 
             const toolCallIndex = state.toolCallIndex++;
             sendSSE(makeChunk({
@@ -1407,7 +1494,7 @@ function writeSSEStream(
             }));
 
             activeBridges.set(bridgeKey, {
-              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs,
+              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
             });
 
             sendSSE(makeChunk({}, "tool_calls"));
@@ -1448,15 +1535,18 @@ function writeSSEStream(
       // Commit checkpoint only on successful completion, not on cancel.
       if (!cancelled && pendingCheckpoint) {
         stored.checkpoint = pendingCheckpoint;
-        stored.checkpointTurnCount = turnCount + 1;
-      } else {
+        stored.checkpointTurnCount = completedTurns.length + 1;
+        stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
       }
     }
     if (cancelled) return;
     if (!mcpExecReceived) {
       const flushed = tagFilter.flush();
       if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-      if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+      if (flushed.content) {
+        appendAssistantTextToTurn(currentTurn, flushed.content);
+        sendSSE(makeChunk({ content: flushed.content }));
+      }
       sendSSE(makeChunk({}, "stop"));
       sendSSE(makeUsageChunk());
       sendDone();
@@ -1479,14 +1569,18 @@ function handleToolResultResume(
   modelId: string,
   bridgeKey: string,
   convKey: string,
-  turnCount: number,
+  completedTurns: ParsedTurn[],
   req: IncomingMessage,
   res: ServerResponse,
 ): void {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
 
   for (const exec of pendingExecs) {
     const result = toolResults.find((r) => r.toolCallId === exec.toolCallId);
+    const turnToolStep = currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === exec.toolCallId);
+    if (turnToolStep && result) {
+      turnToolStep.result = { content: result.content, isError: false };
+    }
     const mcpResult = result
       ? create(McpResultSchema, {
           result: {
@@ -1517,9 +1611,21 @@ function handleToolResultResume(
   }
 
   // Tool results belong to the same user turn that initiated the tool calls.
-  // parseMessages now keeps tool continuations out of completed history, so turnCount
-  // already reflects the correct number of completed turns covered by the checkpoint.
-  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount, req, res);
+  // parseMessages keeps tool continuations out of completed history, so completedTurns
+  // already reflects the correct history covered before this in-flight turn.
+  writeSSEStream(
+    bridge,
+    heartbeatTimer,
+    blobStore,
+    mcpTools,
+    modelId,
+    bridgeKey,
+    convKey,
+    completedTurns,
+    currentTurn,
+    req,
+    res,
+  );
 }
 
 // ── Non-streaming response ──
@@ -1529,7 +1635,8 @@ async function handleNonStreamingResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
-  turnCount: number,
+  completedTurns: ParsedTurn[],
+  currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -1569,6 +1676,7 @@ async function handleNonStreamingResponse(
               if (isThinking) return;
               const { content } = tagFilter.process(text);
               fullText += content;
+              appendAssistantTextToTurn(currentTurn, content);
             },
             () => {},
             (checkpointBytes) => {
@@ -1599,7 +1707,8 @@ async function handleNonStreamingResponse(
         stored.lastAccessMs = Date.now();
         if (!cancelled && !nonStreamError && pendingCheckpoint) {
           stored.checkpoint = pendingCheckpoint;
-          stored.checkpointTurnCount = turnCount + 1;
+          stored.checkpointTurnCount = completedTurns.length + 1;
+          stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
         }
       }
 
@@ -1623,6 +1732,7 @@ async function handleNonStreamingResponse(
 
       const flushed = tagFilter.flush();
       fullText += flushed.content;
+      appendAssistantTextToTurn(currentTurn, flushed.content);
       const usage = computeUsage(state);
 
       res.writeHead(200, { "Content-Type": "application/json" });

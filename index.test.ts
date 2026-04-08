@@ -7,8 +7,10 @@ import {
   deriveConversationKey,
   derivePiSessionId,
   deterministicConversationId,
+  buildCompletedHistoryFingerprint,
   buildCursorRequest,
   parseMessages,
+  shouldDiscardStoredCheckpoint,
 } from "./proxy.ts";
 import type { CursorModel, ParsedTurn } from "./proxy.ts";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
@@ -378,6 +380,14 @@ describe("resolveModelId", () => {
 // ── Session key derivation ──
 
 const msg = (role: "user" | "assistant" | "system", content: string) => ({ role, content });
+const assistantStep = (text: string) => ({ kind: "assistantText", text } as const);
+const toolStep = (
+  toolCallId: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  result?: { content: string; isError: boolean },
+) => ({ kind: "toolCall", toolCallId, toolName, arguments: args, ...(result ? { result } : {}) } as const);
+const turn = (userText: string, steps: ParsedTurn["steps"] = []): ParsedTurn => ({ userText, steps });
 
 describe("deriveBridgeKey", () => {
   test("uses sessionId when provided", () => {
@@ -433,6 +443,62 @@ describe("deriveConversationKey", () => {
   });
 });
 
+describe("completed-history fingerprint", () => {
+  test("same structured history yields same fingerprint", () => {
+    const turns = [
+      turn("u1", [assistantStep("a1")]),
+      turn("u2", [toolStep("tc1", "read", { path: "x" }, { content: "ok", isError: false })]),
+    ];
+    expect(buildCompletedHistoryFingerprint(turns)).toBe(buildCompletedHistoryFingerprint(turns));
+  });
+
+  test("same turn count but different branch history yields different fingerprint", () => {
+    const a = [turn("u1", [assistantStep("branch A")])];
+    const b = [turn("u1", [assistantStep("branch B")])];
+    expect(buildCompletedHistoryFingerprint(a)).not.toBe(buildCompletedHistoryFingerprint(b));
+  });
+
+  test("tool history differences affect fingerprint", () => {
+    const a = [turn("u1", [toolStep("tc1", "read", { path: "x" }, { content: "one", isError: false })])];
+    const b = [turn("u1", [toolStep("tc1", "read", { path: "x" }, { content: "two", isError: false })])];
+    expect(buildCompletedHistoryFingerprint(a)).not.toBe(buildCompletedHistoryFingerprint(b));
+  });
+});
+
+describe("checkpoint reuse guard", () => {
+  test("keeps checkpoint when turn count and fingerprint match", () => {
+    const turns = [turn("u1", [assistantStep("a1")])];
+    const stored = {
+      checkpoint: new Uint8Array([1]),
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(turns),
+    };
+    expect(shouldDiscardStoredCheckpoint(stored, turns)).toBe(false);
+  });
+
+  test("discards checkpoint when same turn count but fingerprint differs", () => {
+    const storedTurns = [turn("u1", [assistantStep("branch A")])];
+    const incomingTurns = [turn("u1", [assistantStep("branch B")])];
+    const stored = {
+      checkpoint: new Uint8Array([1]),
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(storedTurns),
+    };
+    expect(shouldDiscardStoredCheckpoint(stored, incomingTurns)).toBe(true);
+  });
+
+  test("discards checkpoint when tool branch differs at same depth", () => {
+    const storedTurns = [turn("u1", [toolStep("tc1", "read", { path: "x" }, { content: "one", isError: false })])];
+    const incomingTurns = [turn("u1", [toolStep("tc1", "read", { path: "x" }, { content: "two", isError: false })])];
+    const stored = {
+      checkpoint: new Uint8Array([1]),
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(storedTurns),
+    };
+    expect(shouldDiscardStoredCheckpoint(stored, incomingTurns)).toBe(true);
+  });
+});
+
 describe("derivePiSessionId", () => {
   test("prefers pi_session_id over user", () => {
     expect(derivePiSessionId({ pi_session_id: "a", user: "b" })).toBe("a");
@@ -469,15 +535,6 @@ function decodeTurns(state: any) {
     return { userMsg, steps };
   });
 }
-
-const assistantStep = (text: string) => ({ kind: "assistantText", text } as const);
-const toolStep = (
-  toolCallId: string,
-  toolName: string,
-  args: Record<string, unknown>,
-  result?: { content: string; isError: boolean },
-) => ({ kind: "toolCall", toolCallId, toolName, arguments: args, ...(result ? { result } : {}) } as const);
-const turn = (userText: string, steps: ParsedTurn["steps"] = []): ParsedTurn => ({ userText, steps });
 
 describe("buildCursorRequest — turn reconstruction", () => {
   test("no checkpoint, no turns — empty turns array", () => {
