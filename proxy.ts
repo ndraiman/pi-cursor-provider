@@ -147,6 +147,7 @@ export interface StoredConversation {
   /** Number of completed turns the checkpoint covers. */
   checkpointTurnCount: number;
   checkpointHistoryFingerprint: string | null;
+  sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
 }
@@ -497,10 +498,9 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 // ── Request handling ──
 
-function evictStaleConversations(): void {
-  const now = Date.now();
+export function evictStaleConversations(now = Date.now()): void {
   for (const [key, stored] of conversationStates) {
-    if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
+    if (!stored.sessionScoped && now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
       conversationStates.delete(key);
     }
   }
@@ -572,6 +572,7 @@ async function handleChatCompletion(
       checkpoint: null,
       checkpointTurnCount: 0,
       checkpointHistoryFingerprint: null,
+      sessionScoped: !!sessionId,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     };

@@ -6,6 +6,7 @@ import {
   __testInternals,
   cleanupAllSessionState,
   cleanupSessionState,
+  evictStaleConversations,
   deriveBridgeKey,
   deriveBridgeKeyFromSessionId,
   deriveConversationKey,
@@ -481,6 +482,7 @@ describe("checkpoint reuse guard", () => {
       checkpoint: new Uint8Array([1]),
       checkpointTurnCount: 1,
       checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(turns),
+      sessionScoped: true,
     };
     expect(shouldDiscardStoredCheckpoint(stored, turns)).toBe(false);
   });
@@ -492,6 +494,7 @@ describe("checkpoint reuse guard", () => {
       checkpoint: new Uint8Array([1]),
       checkpointTurnCount: 1,
       checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(storedTurns),
+      sessionScoped: true,
     };
     expect(shouldDiscardStoredCheckpoint(stored, incomingTurns)).toBe(true);
   });
@@ -503,6 +506,7 @@ describe("checkpoint reuse guard", () => {
       checkpoint: new Uint8Array([1]),
       checkpointTurnCount: 1,
       checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(storedTurns),
+      sessionScoped: true,
     };
     expect(shouldDiscardStoredCheckpoint(stored, incomingTurns)).toBe(true);
   });
@@ -535,6 +539,7 @@ describe("session cleanup", () => {
       checkpoint: null,
       checkpointTurnCount: 0,
       checkpointHistoryFingerprint: null,
+      sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
@@ -596,6 +601,7 @@ describe("session cleanup hook wiring", () => {
       checkpoint: null,
       checkpointTurnCount: 0,
       checkpointHistoryFingerprint: null,
+      sessionScoped: true,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     });
@@ -622,6 +628,7 @@ describe("session cleanup hook wiring", () => {
         checkpoint: null,
         checkpointTurnCount: 0,
         checkpointHistoryFingerprint: null,
+        sessionScoped: true,
         blobStore: new Map(),
         lastAccessMs: Date.now(),
       });
@@ -629,6 +636,57 @@ describe("session cleanup hook wiring", () => {
       expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
       expect(__testInternals.conversationStates.has(convKey)).toBe(false);
     }
+  });
+});
+
+describe("session-scoped eviction policy", () => {
+  test("evictStaleConversations keeps session-scoped state past TTL", () => {
+    const convKey = deriveConversationKeyFromSessionId("session-ttl");
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-session",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: 0,
+    });
+
+    evictStaleConversations(31 * 60 * 1000);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+  });
+
+  test("evictStaleConversations removes anonymous state past TTL", () => {
+    const convKey = "anon-key";
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-anon",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      sessionScoped: false,
+      blobStore: new Map(),
+      lastAccessMs: 0,
+    });
+
+    evictStaleConversations(31 * 60 * 1000);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+  });
+
+  test("cleanupSessionState still removes session-scoped state explicitly", () => {
+    const sessionId = "session-explicit";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-explicit",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: 0,
+    });
+
+    cleanupSessionState(sessionId);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
   });
 });
 
