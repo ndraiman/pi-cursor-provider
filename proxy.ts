@@ -157,7 +157,7 @@ interface ActiveBridge {
 export interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
-  /** Number of completed turns the checkpoint covers. */
+  /** Number of turns the checkpoint should match against on the next request. */
   checkpointTurnCount: number;
   checkpointHistoryFingerprint: string | null;
   sessionScoped: boolean;
@@ -793,6 +793,10 @@ function appendAssistantTextToTurn(turn: ParsedTurn, text: string): void {
   } else {
     turn.steps.push({ kind: "assistantText", text });
   }
+}
+
+function buildInterruptedRequestHistory(completedTurns: ParsedTurn[], currentTurn: ParsedTurn): ParsedTurn[] {
+  return [...completedTurns, { userText: currentTurn.userText, steps: [] }];
 }
 
 function canonicalizeFingerprintValue(value: unknown): unknown {
@@ -1688,10 +1692,7 @@ function writeSSEStream(
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
   let cancelled = false;
-
-  // Buffer checkpoint during stream — only commit on successful completion.
-  // Cancelled requests must not leave behind a checkpoint for a turn that never completed.
-  let pendingCheckpoint: Uint8Array | null = null;
+  let latestCheckpoint: Uint8Array | null = null;
 
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
@@ -1760,7 +1761,16 @@ function writeSSEStream(
             closeResponse();
           },
           (checkpointBytes) => {
-            pendingCheckpoint = checkpointBytes;
+            latestCheckpoint = checkpointBytes;
+            const stored = conversationStates.get(convKey);
+            if (stored) {
+              stored.checkpoint = checkpointBytes;
+              for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+              const interruptedHistory = buildInterruptedRequestHistory(completedTurns, currentTurn);
+              stored.checkpointTurnCount = interruptedHistory.length;
+              stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint(interruptedHistory);
+              stored.lastAccessMs = Date.now();
+            }
             debugLog("stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
           },
         );
@@ -1784,7 +1794,7 @@ function writeSSEStream(
   bridge.onData(processChunk);
 
   bridge.onClose((code) => {
-    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, currentTurn, pendingCheckpoint });
+    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, currentTurn, latestCheckpoint });
     clearInterval(heartbeatTimer);
     req.removeListener("close", onClientClose);
     res.removeListener("close", onClientClose);
@@ -1792,9 +1802,8 @@ function writeSSEStream(
     if (stored) {
       for (const [k, v] of blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
-      // Commit checkpoint only on successful completion, not on cancel.
-      if (!cancelled && pendingCheckpoint) {
-        stored.checkpoint = pendingCheckpoint;
+      if (!cancelled && latestCheckpoint) {
+        stored.checkpoint = latestCheckpoint;
         stored.checkpointTurnCount = completedTurns.length + 1;
         stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
         debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
@@ -1976,7 +1985,7 @@ async function handleNonStreamingResponse(
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
   let nonStreamError: Error | null = null;
-  let pendingCheckpoint: Uint8Array | null = null;
+  let latestCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
     bridge.onData(createConnectFrameParser(
@@ -1995,7 +2004,16 @@ async function handleNonStreamingResponse(
             },
             () => {},
             (checkpointBytes) => {
-              pendingCheckpoint = checkpointBytes;
+              latestCheckpoint = checkpointBytes;
+              const stored = conversationStates.get(convKey);
+              if (stored) {
+                stored.checkpoint = checkpointBytes;
+                for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+                const interruptedHistory = buildInterruptedRequestHistory(completedTurns, currentTurn);
+                stored.checkpointTurnCount = interruptedHistory.length;
+                stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint(interruptedHistory);
+                stored.lastAccessMs = Date.now();
+              }
               debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
             },
           );
@@ -2014,7 +2032,7 @@ async function handleNonStreamingResponse(
     ));
 
     bridge.onClose(() => {
-      debugLog("nonstream.bridge_close", { requestId, convKey, cancelled, nonStreamError: nonStreamError?.message, currentTurn, pendingCheckpoint });
+      debugLog("nonstream.bridge_close", { requestId, convKey, cancelled, nonStreamError: nonStreamError?.message, currentTurn, latestCheckpoint });
       clearInterval(heartbeatTimer);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);
@@ -2022,8 +2040,8 @@ async function handleNonStreamingResponse(
       if (stored) {
         for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
         stored.lastAccessMs = Date.now();
-        if (!cancelled && !nonStreamError && pendingCheckpoint) {
-          stored.checkpoint = pendingCheckpoint;
+        if (!cancelled && !nonStreamError && latestCheckpoint) {
+          stored.checkpoint = latestCheckpoint;
           stored.checkpointTurnCount = completedTurns.length + 1;
           stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
           debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });

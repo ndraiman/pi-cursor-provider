@@ -37,7 +37,9 @@ import {
   ConversationStepSchema,
   ExecServerMessageSchema,
   InteractionUpdateSchema,
+  KvServerMessageSchema,
   McpArgsSchema,
+  SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   UserMessageSchema,
 } from "./proto/agent_pb.ts";
@@ -1116,6 +1118,21 @@ function makeCheckpointMessage() {
   });
 }
 
+function makeSetBlobMessage(blobId: Uint8Array, blobData: Uint8Array) {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "kvServerMessage",
+      value: create(KvServerMessageSchema, {
+        id: 1,
+        message: {
+          case: "setBlobArgs",
+          value: create(SetBlobArgsSchema, { blobId, blobData }),
+        },
+      }),
+    },
+  });
+}
+
 function makeMcpExecMessage(toolCallId: string, toolName: string, args: Record<string, string>) {
   return create(AgentServerMessageSchema, {
     message: {
@@ -1338,12 +1355,74 @@ describe("proxy integration — session handling", () => {
     ]));
   });
 
-  test("stream cancellation sends cancelAction and does not commit a checkpoint", async () => {
+  test("tool-call pause closes the SSE without cancelling the live bridge", async () => {
+    let cancelCount = 0;
+    const sessionId = "session-tool-pause-close";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const currentTurn = turn("inspect file");
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-tool-pause-close",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
+      if (clientMessage.message.case === "conversationAction") {
+        expect(clientMessage.message.value.action.case).toBe("cancelAction");
+        cancelCount += 1;
+        fake.close(0);
+      }
+    });
+
+    const req = new EventEmitter() as any;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = () => true;
+    res.end = () => {
+      res.headersSent = true;
+      queueMicrotask(() => res.emit("close"));
+      return res;
+    };
+
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer,
+      modelId: "gpt-5",
+      bridgeKey,
+      convKey,
+      completedTurns: [],
+      currentTurn,
+      req,
+      res,
+    });
+
+    bridge.emitServerMessage(makeMcpExecMessage("tc1", "read", { path: "README.md" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(cancelCount).toBe(0);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+  });
+
+  test("stream cancellation sends cancelAction and persists the latest checkpoint and blob store immediately", async () => {
     let cancelCount = 0;
     const sessionId = "session-cancel";
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
     const currentTurn = turn("interrupt me");
+    const blobId = new Uint8Array([1, 2, 3, 4]);
+    const blobKey = Buffer.from(blobId).toString("hex");
+    const blobData = new TextEncoder().encode("blob payload");
 
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-cancel",
@@ -1393,15 +1472,195 @@ describe("proxy integration — session handling", () => {
     });
 
     bridge.emitServerMessage(makeTextDeltaMessage("partial output"));
+    bridge.emitServerMessage(makeSetBlobMessage(blobId, blobData));
     bridge.emitServerMessage(makeCheckpointMessage());
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const stored = __testInternals.conversationStates.get(convKey);
     expect(cancelCount).toBe(1);
     expect(stored).toBeDefined();
-    expect(stored?.checkpoint).toBeNull();
-    expect(stored?.checkpointTurnCount).toBe(0);
+    expect(stored?.checkpoint).toBeTruthy();
+    expect(stored?.checkpointTurnCount).toBe(1);
+    expect(stored?.checkpointHistoryFingerprint).toBe(buildCompletedHistoryFingerprint([
+      turn("interrupt me"),
+    ]));
+    expect(Array.from(stored?.blobStore.get(blobKey) ?? [])).toEqual(Array.from(blobData));
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+  });
+
+  test("interrupt after a checkpoint reuses the stored checkpoint on the next request", async () => {
+    const sessionId = "session-interrupt-after-checkpoint";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const currentTurn = turn("interrupt me");
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-interrupt-after-checkpoint",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const interruptedBridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
+      if (clientMessage.message.case === "conversationAction") {
+        fake.close(0);
+      }
+    });
+
+    const req = new EventEmitter() as any;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = () => {
+      queueMicrotask(() => res.emit("close"));
+      return true;
+    };
+    res.end = () => {
+      res.headersSent = true;
+      return res;
+    };
+
+    writeSSEStreamForTests({
+      bridge: interruptedBridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "gpt-5",
+      bridgeKey,
+      convKey,
+      completedTurns: [],
+      currentTurn,
+      req,
+      res,
+    });
+
+    interruptedBridge.emitServerMessage(makeTextDeltaMessage("partial output"));
+    interruptedBridge.emitServerMessage(makeCheckpointMessage());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const storedCheckpoint = __testInternals.conversationStates.get(convKey)?.checkpoint;
+    expect(storedCheckpoint).toBeTruthy();
+
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
+      if (clientMessage.message.case === "runRequest") {
+        runRequests.push(clientMessage.message.value);
+        fake.close(0);
+      }
+    }));
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "interrupt me" },
+        { role: "user", content: "continue" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+    expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).toEqual(storedCheckpoint);
+    expect(runRequests[0].conversationId).toBe("conv-interrupt-after-checkpoint");
+  });
+
+  test("interrupt before any checkpoint keeps the conversation id and rebuilds from the full current history", async () => {
+    const sessionId = "session-interrupt-before-checkpoint";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const priorTurns = [turn("earlier", [assistantStep("done")])];
+    const priorPayload = buildCursorRequest("gpt-5", "system", "next", priorTurns, "conv-old", null);
+    const priorCheckpoint = toBinary(ConversationStateStructureSchema, decodeRunRequest(priorPayload).conversationState);
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-old",
+      checkpoint: priorCheckpoint,
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(priorTurns),
+      sessionScoped: true,
+      blobStore: new Map(priorPayload.blobStore),
+      lastAccessMs: Date.now(),
+    });
+
+    const interruptedBridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
+      if (clientMessage.message.case === "conversationAction") {
+        fake.close(0);
+      }
+    });
+
+    const req = new EventEmitter() as any;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = () => {
+      queueMicrotask(() => res.emit("close"));
+      return true;
+    };
+    res.end = () => {
+      res.headersSent = true;
+      return res;
+    };
+
+    writeSSEStreamForTests({
+      bridge: interruptedBridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "gpt-5",
+      bridgeKey,
+      convKey,
+      completedTurns: priorTurns,
+      currentTurn: turn("interrupt me"),
+      req,
+      res,
+    });
+
+    interruptedBridge.emitServerMessage(makeTextDeltaMessage("partial output"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const storedAfterAbort = __testInternals.conversationStates.get(convKey);
+    expect(storedAfterAbort?.checkpoint).toEqual(priorCheckpoint);
+    expect(storedAfterAbort?.conversationId).toBe("conv-old");
+
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
+      if (clientMessage.message.case === "runRequest") {
+        runRequests.push(clientMessage.message.value);
+        fake.close(0);
+      }
+    }));
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "interrupt me" },
+        { role: "user", content: "continue" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+    expect(runRequests[0].conversationId).toBe("conv-old");
+    const decoded = decodeTurns(runRequests[0].conversationState);
+    expect(decoded).toHaveLength(2);
+    expect(decoded[0].userMsg.text).toBe("earlier");
+    expect((decoded[0].steps[0]?.message.value as any).text).toBe("done");
+    expect(decoded[1].userMsg.text).toBe("interrupt me");
+    expect(decoded[1].steps).toHaveLength(0);
+    expect(runRequests[0].action.action.value.userMessage.text).toBe("continue");
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toBeNull();
   });
 
   test("same-depth branch divergence discards a stale stored checkpoint before the upstream run starts", async () => {
