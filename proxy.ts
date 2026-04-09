@@ -709,7 +709,9 @@ async function handleChatCompletion(
   // choke on stale server-side state from a previous interrupted connection.
   // The full conversation history is still rebuilt from turns.
   if (!stored.checkpoint) {
+    const previousConversationId = stored.conversationId;
     stored.conversationId = crypto.randomUUID();
+    debugLog("chat.fresh_conversation_id", { requestId, convKey, previousConversationId, newConversationId: stored.conversationId });
   }
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
@@ -1028,7 +1030,7 @@ export function buildCursorRequest(
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
-    const turnBytes: Uint8Array[] = [];
+    const turnBlobIds: Uint8Array[] = [];
     for (const turn of turns) {
       const userMsg = create(UserMessageSchema, {
         text: turn.userText,
@@ -1044,12 +1046,15 @@ export function buildCursorRequest(
       const turnStructure = create(ConversationTurnStructureSchema, {
         turn: { case: "agentConversationTurn", value: agentTurn },
       });
-      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+      const turnData = toBinary(ConversationTurnStructureSchema, turnStructure);
+      const turnBlobId = new Uint8Array(createHash("sha256").update(turnData).digest());
+      blobStore.set(Buffer.from(turnBlobId).toString("hex"), turnData);
+      turnBlobIds.push(turnBlobId);
     }
 
     conversationState = create(ConversationStateStructureSchema, {
       rootPromptMessagesJson: [systemBlobId],
-      turns: turnBytes,
+      turns: turnBlobIds,
       todos: [],
       pendingToolCalls: [],
       previousWorkspaceUris: [],

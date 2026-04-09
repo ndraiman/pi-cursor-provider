@@ -673,8 +673,14 @@ function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>) {
   return clientMsg.message.value as InstanceType<typeof AgentRunRequestSchema["$typeName"]> & any;
 }
 
-function decodeTurns(state: any) {
-  return (state.turns as Uint8Array[]).map((turnBytes: Uint8Array) => {
+function decodeTurns(state: any, blobStore?: Map<string, Uint8Array>) {
+  return (state.turns as Uint8Array[]).map((turnBlobIdOrData: Uint8Array) => {
+    // Turns may be blob references (SHA-256 hashes) or inline data
+    let turnBytes = turnBlobIdOrData;
+    if (blobStore && turnBlobIdOrData.length === 32) {
+      const resolved = blobStore.get(Buffer.from(turnBlobIdOrData).toString("hex"));
+      if (resolved) turnBytes = resolved;
+    }
     const turnStruct = fromBinary(ConversationTurnStructureSchema, turnBytes);
     expect(turnStruct.turn.case).toBe("agentConversationTurn");
     const agentTurn = turnStruct.turn.value as any;
@@ -701,7 +707,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     const payload = buildCursorRequest("gpt-5", "system", "third question", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
 
-    const decoded = decodeTurns(req.conversationState);
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
     expect(decoded).toHaveLength(2);
 
     expect(decoded[0].userMsg.text).toBe("first question");
@@ -727,7 +733,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     ];
     const payload = buildCursorRequest("gpt-5", "system", "fix it", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState);
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
 
     expect(decoded).toHaveLength(1);
     expect(decoded[0].userMsg.text).toBe("inspect file");
@@ -754,7 +760,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     const turns = [turn("hello")];
     const payload = buildCursorRequest("gpt-5", "system", "follow up", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState);
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
     expect(decoded).toHaveLength(1);
     expect(decoded[0].userMsg.text).toBe("hello");
     expect(decoded[0].steps).toHaveLength(0);
@@ -790,7 +796,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     ];
     const payload = buildCursorRequest("gpt-5", "system", "c", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState);
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
     expect(decoded[0].userMsg.messageId).not.toBe(decoded[1].userMsg.messageId);
   });
 });
@@ -803,7 +809,7 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     const payload = buildCursorRequest("gpt-5", "system", "forked question", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
 
-    const decoded = decodeTurns(req.conversationState);
+    const decoded = decodeTurns(req.conversationState, payload.blobStore);
     expect(decoded).toHaveLength(1);
     expect(decoded[0].userMsg.text).toBe("first");
     expect((decoded[0].steps[0].message.value as any).text).toBe("response1");
