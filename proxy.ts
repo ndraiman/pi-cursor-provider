@@ -788,6 +788,15 @@ function stripTurnRuntimeState(turn: ParsedTurn & {
   return { userText: turn.userText, steps: turn.steps };
 }
 
+/** Hidden pi-subagents roster injected as a user-role custom message. */
+function isSubagentRosterInjection(text: string): boolean {
+  return text.includes("<subagent-roster>") || text.includes("subagent_roster");
+}
+
+function shouldMergeConsecutiveUserChunks(previousText: string, currentText: string): boolean {
+  return isSubagentRosterInjection(previousText) || isSubagentRosterInjection(currentText);
+}
+
 export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const turns: ParsedTurn[] = [];
@@ -877,6 +886,19 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
     if (currentTurn.steps.length === 0 || isToolContinuation) {
       userText = currentTurn.userText;
+      // Pi may emit multiple consecutive user-role messages before the next
+      // assistant reply (for example the real prompt plus a hidden
+      // subagent_roster custom message). Merge only when one chunk is that
+      // ambient injection so interrupt + continue still sends the latest
+      // user message alone.
+      while (turns.length > 0 && turns[turns.length - 1]!.steps.length === 0) {
+        const previous = turns[turns.length - 1]!;
+        if (!shouldMergeConsecutiveUserChunks(previous.userText, userText)) break;
+        const merged = turns.pop()!;
+        userText = userText
+          ? `${merged.userText}\n\n${userText}`
+          : merged.userText;
+      }
       if (hasAnyToolResults) {
         toolResults = toolCallSteps
           .filter((step) => step.result)
