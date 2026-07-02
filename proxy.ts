@@ -877,6 +877,20 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
     if (currentTurn.steps.length === 0 || isToolContinuation) {
       userText = currentTurn.userText;
+      // Pi may emit multiple consecutive user-role messages before the first
+      // assistant reply (for example the real prompt plus a hidden
+      // subagent_roster custom message). Merge those chunks; once a turn has
+      // completed with assistant/tool steps, later consecutive user messages
+      // are separate (for example interrupt + continue).
+      const hasCompletedTurn = turns.some((turn) => turn.steps.length > 0);
+      if (!hasCompletedTurn) {
+        while (turns.length > 0 && turns[turns.length - 1]!.steps.length === 0) {
+          const previous = turns.pop()!;
+          userText = userText
+            ? `${previous.userText}\n\n${userText}`
+            : previous.userText;
+        }
+      }
       if (hasAnyToolResults) {
         toolResults = toolCallSteps
           .filter((step) => step.result)

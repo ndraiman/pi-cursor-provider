@@ -945,6 +945,21 @@ describe("parseMessages — structured tool turns", () => {
     expect(parsed.userText).toBe("review it");
     expect(parsed.toolResults).toEqual([{ toolCallId: "t1", content: "pkg" }]);
   });
+
+  test("merges consecutive user-only messages into active userText", () => {
+    const parsed = parseMessages([
+      { role: "user" as const, content: "What is the Deutsche Post API?" },
+      {
+        role: "user" as const,
+        content:
+          "<system-reminder>\n<subagent-roster>ops, scout, worker</subagent-roster>\n</system-reminder>",
+      },
+    ]);
+
+    expect(parsed.turns).toHaveLength(0);
+    expect(parsed.userText).toContain("Deutsche Post API");
+    expect(parsed.userText).toContain("subagent-roster");
+  });
 });
 
 function frameConnectMessageForTest(data: Uint8Array, flags = 0): Buffer {
