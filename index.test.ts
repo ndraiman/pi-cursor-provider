@@ -960,6 +960,45 @@ describe("parseMessages — structured tool turns", () => {
     expect(parsed.userText).toContain("Deutsche Post API");
     expect(parsed.userText).toContain("subagent-roster");
   });
+
+  test("merges roster injection after completed turns", () => {
+    const parsed = parseMessages([
+      { role: "user" as const, content: "fill the pdf" },
+      { role: "assistant" as const, content: "still need answers 1-9" },
+      { role: "user" as const, content: "1. Herr\n2. Blank" },
+      {
+        role: "user" as const,
+        content:
+          "<system-reminder>\n<subagent-roster>ops, scout, worker</subagent-roster>\n</system-reminder>",
+      },
+    ]);
+
+    expect(parsed.turns).toHaveLength(1);
+    expect(parsed.userText).toContain("1. Herr");
+    expect(parsed.userText).toContain("subagent-roster");
+  });
+
+  test("does not merge interrupt plus continue user messages", () => {
+    const parsed = parseMessages([
+      { role: "user" as const, content: "interrupt me" },
+      { role: "user" as const, content: "continue" },
+    ]);
+
+    expect(parsed.turns).toHaveLength(1);
+    expect(parsed.userText).toBe("continue");
+  });
+
+  test("does not merge interrupt plus continue after completed turns", () => {
+    const parsed = parseMessages([
+      { role: "user" as const, content: "earlier" },
+      { role: "assistant" as const, content: "done" },
+      { role: "user" as const, content: "interrupt me" },
+      { role: "user" as const, content: "continue" },
+    ]);
+
+    expect(parsed.turns).toHaveLength(2);
+    expect(parsed.userText).toBe("continue");
+  });
 });
 
 function frameConnectMessageForTest(data: Uint8Array, flags = 0): Buffer {
