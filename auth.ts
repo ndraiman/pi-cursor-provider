@@ -10,6 +10,10 @@
  * Based on https://github.com/ephraimduncan/opencode-cursor by Ephraim Duncan.
  */
 
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join as pathJoin } from "node:path";
+
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
 const CURSOR_REFRESH_URL = "https://api2.cursor.sh/auth/exchange_user_api_key";
@@ -144,6 +148,11 @@ export async function refreshCursorToken(
 
 // ── JWT expiry extraction ──
 
+export function getCursorAccessTokenFromEnv(): string | undefined {
+  const token = process.env.CURSOR_ACCESS_TOKEN?.trim();
+  return token || undefined;
+}
+
 export function getTokenExpiry(token: string): number {
   try {
     const parts = token.split(".");
@@ -162,4 +171,71 @@ export function getTokenExpiry(token: string): number {
     }
   } catch {}
   return Date.now() + 3600 * 1000;
+}
+
+export type StartupOAuthTokenSource = "pi_oauth" | "pi_oauth_refresh";
+
+export function getPiAgentDir(): string {
+  const configured = process.env.PI_AGENT_DIR?.trim();
+  return configured || pathJoin(homedir(), ".pi", "agent");
+}
+
+interface AuthJsonCursor {
+  type?: string;
+  access?: string;
+  refresh?: string;
+  expires?: number;
+}
+
+export function readStoredCursorOAuthFromFile(
+  agentDir: string = getPiAgentDir(),
+): CursorCredentials | undefined {
+  const authPath = pathJoin(agentDir, "auth.json");
+  if (!existsSync(authPath)) return undefined;
+
+  try {
+    const auth = JSON.parse(readFileSync(authPath, "utf8")) as { cursor?: AuthJsonCursor };
+    const cursor = auth.cursor;
+    if (cursor?.type !== "oauth" || !cursor.access || !cursor.refresh) return undefined;
+    return {
+      access: cursor.access,
+      refresh: cursor.refresh,
+      expires:
+        typeof cursor.expires === "number" ? cursor.expires : getTokenExpiry(cursor.access),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeStoredCursorOAuthToFile(
+  credentials: CursorCredentials,
+  agentDir: string = getPiAgentDir(),
+): void {
+  const authPath = pathJoin(agentDir, "auth.json");
+  let auth: Record<string, unknown> = {};
+  if (existsSync(authPath)) {
+    try {
+      auth = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>;
+    } catch {
+      auth = {};
+    }
+  }
+  auth.cursor = { type: "oauth", ...credentials };
+  writeFileSync(authPath, `${JSON.stringify(auth, null, 2)}\n`, "utf8");
+}
+
+export async function getStoredCursorOAuthAccessTokenForStartup(): Promise<
+  { accessToken: string; source: StartupOAuthTokenSource } | undefined
+> {
+  const credential = readStoredCursorOAuthFromFile();
+  if (!credential) return undefined;
+
+  if (Date.now() < credential.expires && credential.access) {
+    return { accessToken: credential.access, source: "pi_oauth" };
+  }
+
+  const refreshed = await refreshCursorToken(credential.refresh);
+  writeStoredCursorOAuthToFile(refreshed);
+  return { accessToken: refreshed.access, source: "pi_oauth_refresh" };
 }

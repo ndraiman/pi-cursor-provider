@@ -1,7 +1,14 @@
 import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
+import {
+  getStoredCursorOAuthAccessTokenForStartup,
+  readStoredCursorOAuthFromFile,
+} from "./auth.ts";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
   resolveModelId,
@@ -1701,5 +1708,53 @@ describe("proxy integration — session handling", () => {
     expect(toBinary(ConversationStateStructureSchema, runRequests[0].conversationState)).toEqual(storedCheckpoint);
   });
 
+});
+
+describe("startup auth file discovery", () => {
+  test("readStoredCursorOAuthFromFile reads cursor oauth credentials from auth.json", () => {
+    const agentDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-auth-"));
+    writeFileSync(
+      pathJoin(agentDir, "auth.json"),
+      JSON.stringify({
+        cursor: {
+          type: "oauth",
+          access: "access-token",
+          refresh: "refresh-token",
+          expires: Date.now() + 60_000,
+        },
+      }),
+      "utf8",
+    );
+
+    expect(readStoredCursorOAuthFromFile(agentDir)).toEqual({
+      access: "access-token",
+      refresh: "refresh-token",
+      expires: expect.any(Number),
+    });
+  });
+
+  test("getStoredCursorOAuthAccessTokenForStartup returns stored access token", async () => {
+    const agentDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-auth-"));
+    process.env.PI_AGENT_DIR = agentDir;
+    writeFileSync(
+      pathJoin(agentDir, "auth.json"),
+      JSON.stringify({
+        cursor: {
+          type: "oauth",
+          access: "access-token",
+          refresh: "refresh-token",
+          expires: Date.now() + 60_000,
+        },
+      }),
+      "utf8",
+    );
+
+    await expect(getStoredCursorOAuthAccessTokenForStartup()).resolves.toEqual({
+      accessToken: "access-token",
+      source: "pi_oauth",
+    });
+
+    delete process.env.PI_AGENT_DIR;
+  });
 });
 

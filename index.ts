@@ -20,6 +20,8 @@ import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import {
   generateCursorAuthParams,
+  getCursorAccessTokenFromEnv,
+  getStoredCursorOAuthAccessTokenForStartup,
   getTokenExpiry,
   pollCursorAuth,
   refreshCursorToken,
@@ -362,6 +364,16 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
 
 // ── Extension ──
 
+type StartupTokenSource = "env" | "pi_oauth" | "pi_oauth_refresh";
+
+async function getStartupCursorAccessToken(): Promise<
+  { accessToken: string; source: StartupTokenSource } | undefined
+> {
+  const envToken = getCursorAccessTokenFromEnv();
+  if (envToken) return { accessToken: envToken, source: "env" };
+  return getStoredCursorOAuthAccessTokenForStartup();
+}
+
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
   const cleanupCurrentSession = (_event: unknown, ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } }) => {
     debugExtensionLog("session.cleanup_hook", {
@@ -488,7 +500,43 @@ export default async function (pi: ExtensionAPI) {
 
   // Await proxy so models are registered before pi proceeds with model resolution.
   const port = await proxyReady;
-  register(pi, port, FALLBACK_MODELS);
+  const startupModels = await discoverStartupModels();
+  register(pi, port, startupModels);
+
+  async function discoverStartupModels(): Promise<CursorModel[]> {
+    if (process.env.PI_OFFLINE) return FALLBACK_MODELS;
+
+    let startupToken: { accessToken: string; source: StartupTokenSource } | undefined;
+    try {
+      startupToken = await getStartupCursorAccessToken();
+    } catch (err) {
+      debugExtensionLog("model_discovery.startup.token_failed", {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    if (!startupToken) {
+      debugExtensionLog("model_discovery.startup.skipped", { reason: "no_cursor_oauth_token" });
+      return FALLBACK_MODELS;
+    }
+
+    try {
+      currentToken = startupToken.accessToken;
+      const discovered = await getCursorModels(startupToken.accessToken);
+      debugExtensionLog("model_discovery.startup", {
+        tokenSource: startupToken.source,
+        discoveredCount: discovered.length,
+      });
+      if (discovered.length > 0) return discovered;
+    } catch (err) {
+      debugExtensionLog("model_discovery.startup.failed", {
+        tokenSource: startupToken.source,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    return FALLBACK_MODELS;
+  }
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
