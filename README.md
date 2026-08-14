@@ -40,6 +40,12 @@ npm install
 /model            # select a Cursor model
 ```
 
+## Multiple Cursor accounts
+
+The provider exposes `cursor-shared.ts` for `pi-multi-account`. When that extension finds this checkout, it registers `cursor` and numbered slots such as `cursor-account-2`. Each slot has its own OAuth credentials, model discovery cache, proxy route, and conversation state.
+
+Install `pi-multi-account` separately, then log in through Pi's subscription picker. The provider keeps the original `/v1` routes for single-account installations and adds provider-scoped routes for the numbered slots.
+
 ## Model Mapping
 
 Cursor exposes many model variants that encode **effort level** (`low`, `medium`, `high`, `xhigh`, `max`, `none`) and **speed** (`-fast`) or **thinking** (`-thinking`) in the model ID. This extension deduplicates them so pi's reasoning effort setting controls the effort level.
@@ -99,7 +105,7 @@ PI_CURSOR_RAW_MODELS=1 pi
 
 ## Session Management
 
-The proxy maintains conversation state per pi session, enabling multi-turn conversations with Cursor models while preserving forks, tool continuations, and interruptions correctly.
+The proxy maintains conversation state per Pi session and provider slot, enabling multi-turn conversations with Cursor models while preserving forks, tool continuations, and interruptions correctly.
 
 ### How it works
 

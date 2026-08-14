@@ -212,6 +212,7 @@ interface ParsedMessages {
 
 const activeBridges = new Map<string, ActiveBridge>();
 const conversationStates = new Map<string, StoredConversation>();
+const cursorProviderIds = new Set<string>(["cursor"]);
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 let bridgeFactory: BridgeFactory = spawnBridge;
 let debugRequestCounter = 0;
@@ -299,7 +300,9 @@ export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
 
 let proxyServer: ReturnType<typeof createServer> | undefined;
 let proxyPort: number | undefined;
-let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
+// Provider-aware token resolution lets pi-multi-account route each Cursor slot
+// through the credentials stored under its provider ID.
+let proxyAccessTokenProvider: ((providerId: string) => Promise<string>) | undefined;
 
 // ── Bridge spawn ──
 
@@ -436,10 +439,11 @@ export interface CursorModel {
   maxTokens: number;
 }
 
-let cachedModels: CursorModel[] | null = null;
+const cachedModels = new Map<string, CursorModel[]>();
 
 export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
-  if (cachedModels) return cachedModels;
+  const cached = cachedModels.get(apiKey);
+  if (cached) return cached;
   try {
     const requestPayload = create(GetUsableModelsRequestSchema, {});
     const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
@@ -462,7 +466,7 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
       if (decoded?.models?.length) {
         const models = normalizeCursorModels(decoded.models);
         if (models.length > 0) {
-          cachedModels = models;
+          cachedModels.set(apiKey, models);
           return models;
         }
       }
@@ -515,7 +519,7 @@ export function getProxyPort(): number | undefined {
 }
 
 export async function startProxy(
-  getAccessToken: () => Promise<string>,
+  getAccessToken: (providerId: string) => Promise<string>,
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
   if (proxyServer && proxyPort) return proxyPort;
@@ -526,20 +530,25 @@ export async function startProxy(
       const requestId = nextDebugRequestId();
       debugLog("http.request", { requestId, method: req.method, pathname: url.pathname, headers: req.headers });
 
-      if (req.method === "GET" && url.pathname === "/v1/models") {
+      const providerMatch = url.pathname.match(/^\/v1\/([^/]+)\/(models|chat\/completions)$/);
+      const providerId = providerMatch?.[1] ? decodeURIComponent(providerMatch[1]) : "cursor";
+      const endpoint = providerMatch?.[2] ?? url.pathname.slice("/v1/".length);
+
+      if (req.method === "GET" && endpoint === "models" && (url.pathname === "/v1/models" || providerMatch)) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ object: "list", data: [] }));
         return;
       }
 
-      if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+      if (req.method === "POST" && endpoint === "chat/completions" && (url.pathname === "/v1/chat/completions" || providerMatch)) {
         try {
           const body = await readBody(req);
           const parsed = JSON.parse(body) as ChatCompletionRequest;
-          debugLog("http.chat.body", { requestId, body: parsed });
+          debugLog("http.chat.body", { requestId, providerId, body: parsed });
           if (!proxyAccessTokenProvider) throw new Error("No access token provider");
-          const accessToken = await proxyAccessTokenProvider();
-          await handleChatCompletion(parsed, accessToken, req, res, requestId);
+          cursorProviderIds.add(providerId);
+          const accessToken = await proxyAccessTokenProvider(providerId);
+          await handleChatCompletion(parsed, accessToken, providerId, req, res, requestId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           debugLog("http.chat.error", { requestId, message, stack: err instanceof Error ? err.stack : undefined });
@@ -583,6 +592,8 @@ export function stopProxy(): void {
     proxyPort = undefined;
     proxyAccessTokenProvider = undefined;
   }
+  cursorProviderIds.clear();
+  cursorProviderIds.add("cursor");
   cleanupAllSessionState();
 }
 
@@ -631,6 +642,7 @@ export function resolveModelId(model: string, reasoningEffort?: string): string 
 async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  providerId: string,
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
@@ -659,8 +671,8 @@ async function handleChatCompletion(
   }
 
   const sessionId = derivePiSessionId(body);
-  const bridgeKey = deriveBridgeKey(body.messages, sessionId);
-  const convKey = deriveConversationKey(body.messages, sessionId);
+  const bridgeKey = deriveBridgeKey(body.messages, sessionId, providerId);
+  const convKey = deriveConversationKey(body.messages, sessionId, providerId);
   const activeBridge = activeBridges.get(bridgeKey);
   debugLog("chat.session_keys", {
     requestId,
@@ -1354,36 +1366,39 @@ export function derivePiSessionId(body: Pick<ChatCompletionRequest, "pi_session_
   return trimmed ? trimmed : undefined;
 }
 
-export function deriveBridgeKeyFromSessionId(sessionId: string): string {
-  return createHash("sha256").update(`bridge:${sessionId}`).digest("hex").slice(0, 16);
+export function deriveBridgeKeyFromSessionId(sessionId: string, providerId = "cursor"): string {
+  return createHash("sha256").update(`bridge:${providerId}:${sessionId}`).digest("hex").slice(0, 16);
 }
 
-export function deriveConversationKeyFromSessionId(sessionId: string): string {
-  return createHash("sha256").update(`conv:${sessionId}`).digest("hex").slice(0, 16);
+export function deriveConversationKeyFromSessionId(sessionId: string, providerId = "cursor"): string {
+  return createHash("sha256").update(`conv:${providerId}:${sessionId}`).digest("hex").slice(0, 16);
 }
 
-export function deriveBridgeKey(messages: OpenAIMessage[], sessionId?: string): string {
-  if (sessionId) return deriveBridgeKeyFromSessionId(sessionId);
+export function deriveBridgeKey(messages: OpenAIMessage[], sessionId?: string, providerId = "cursor"): string {
+  if (sessionId) return deriveBridgeKeyFromSessionId(sessionId, providerId);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256").update(`bridge:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+  return createHash("sha256").update(`bridge:${providerId}:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
 
-export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
-  if (sessionId) return deriveConversationKeyFromSessionId(sessionId);
+export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string, providerId = "cursor"): string {
+  if (sessionId) return deriveConversationKeyFromSessionId(sessionId, providerId);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256").update(`conv:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+  return createHash("sha256").update(`conv:${providerId}:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
 
-export function cleanupSessionState(sessionId?: string): void {
+export function cleanupSessionState(sessionId?: string, providerId?: string): void {
   if (!sessionId) return;
-  const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
-  const convKey = deriveConversationKeyFromSessionId(sessionId);
-  const active = activeBridges.get(bridgeKey);
-  debugLog("session.cleanup", { sessionId, bridgeKey, convKey, hasActiveBridge: !!active, hadConversation: conversationStates.has(convKey) });
-  if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
-  conversationStates.delete(convKey);
+  const providerIds = providerId ? [providerId] : [...cursorProviderIds];
+  for (const currentProviderId of providerIds) {
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId, currentProviderId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId, currentProviderId);
+    const active = activeBridges.get(bridgeKey);
+    debugLog("session.cleanup", { sessionId, providerId: currentProviderId, bridgeKey, convKey, hasActiveBridge: !!active, hadConversation: conversationStates.has(convKey) });
+    if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+    conversationStates.delete(convKey);
+  }
 }
 
 export function deterministicConversationId(convKey: string): string {

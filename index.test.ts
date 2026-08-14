@@ -2,7 +2,8 @@ import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
-import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
+import { buildEffortMap, FALLBACK_MODELS, isCursorProviderId, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
+import { registerCursorProvider } from "./cursor-shared.ts";
 import {
   resolveModelId,
   __testInternals,
@@ -447,6 +448,12 @@ describe("deriveBridgeKey", () => {
     const b = deriveBridgeKey([msg("user", "goodbye")]);
     expect(a).not.toBe(b);
   });
+
+  test("namespaces identical sessions by provider slot", () => {
+    const cursor = deriveBridgeKey([msg("user", "hello")], "session-1", "cursor");
+    const second = deriveBridgeKey([msg("user", "hello")], "session-1", "cursor-account-2");
+    expect(cursor).not.toBe(second);
+  });
 });
 
 describe("deriveConversationKey", () => {
@@ -466,6 +473,37 @@ describe("deriveConversationKey", () => {
     const a = deriveConversationKey([msg("user", "hello")]);
     const b = deriveConversationKey([msg("user", "hello"), msg("assistant", "hi")]);
     expect(a).toBe(b);
+  });
+
+  test("namespaces anonymous conversations by provider slot", () => {
+    const cursor = deriveConversationKey([msg("user", "hello")], undefined, "cursor");
+    const second = deriveConversationKey([msg("user", "hello")], undefined, "cursor-account-2");
+    expect(cursor).not.toBe(second);
+  });
+});
+
+describe("Cursor provider slots", () => {
+  test("recognizes the base provider and numbered account slots", () => {
+    expect(isCursorProviderId("cursor")).toBe(true);
+    expect(isCursorProviderId("cursor-account-2")).toBe(true);
+    expect(isCursorProviderId("cursor-account-x")).toBe(false);
+    expect(isCursorProviderId("openai-codex-account-2")).toBe(false);
+  });
+
+  test("registers a slot on a provider-scoped proxy URL", () => {
+    const registrations = new Map<string, any>();
+    const pi = {
+      registerProvider(providerId: string, config: any) {
+        registrations.set(providerId, config);
+      },
+    } as any;
+
+    registerCursorProvider(pi, "cursor-account-2", 4321, [m("gpt-5")]);
+
+    expect(registrations.get("cursor-account-2")?.baseUrl).toBe(
+      "http://127.0.0.1:4321/v1/cursor-account-2",
+    );
+    expect(registrations.get("cursor-account-2")?.oauth?.name).toBe("Cursor (cursor-account-2)");
   });
 });
 
@@ -1106,12 +1144,16 @@ function makeMcpExecMessage(toolCallId: string, toolName: string, args: Record<s
   });
 }
 
-async function postChatCompletion(port: number, body: Record<string, unknown>) {
+async function postChatCompletion(
+  port: number,
+  body: Record<string, unknown>,
+  path = "/v1/chat/completions",
+) {
   return new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
     const req = httpRequest({
       hostname: "127.0.0.1",
       port,
-      path: "/v1/chat/completions",
+      path,
       method: "POST",
       headers: { "Content-Type": "application/json" },
     }, (res) => {
@@ -1127,6 +1169,48 @@ async function postChatCompletion(port: number, body: Record<string, unknown>) {
 }
 
 describe("proxy integration — session handling", () => {
+  test("routes a provider-scoped request to its account token and state namespace", async () => {
+    const resolvedProviders: string[] = [];
+    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
+      if (clientMessage.message.case !== "runRequest") return;
+      setTimeout(() => {
+        fake.emitServerMessage(makeTextDeltaMessage("slot response"));
+        fake.emitServerMessage(makeCheckpointMessage());
+        fake.close(0);
+      }, 0);
+    }));
+
+    const port = await startProxy(async (providerId) => {
+      resolvedProviders.push(providerId);
+      return `${providerId}-token`;
+    });
+    const sessionId = "session-cursor-account-2";
+    const response = await postChatCompletion(
+      port,
+      {
+        model: "gpt-5",
+        pi_session_id: sessionId,
+        messages: [{ role: "user", content: "use the second Cursor account" }],
+      },
+      "/v1/cursor-account-2/chat/completions",
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("slot response");
+    expect(resolvedProviders).toEqual(["cursor-account-2"]);
+    expect(__testInternals.conversationStates.has(
+      deriveConversationKeyFromSessionId(sessionId, "cursor-account-2"),
+    )).toBe(true);
+    expect(__testInternals.conversationStates.has(
+      deriveConversationKeyFromSessionId(sessionId, "cursor"),
+    )).toBe(false);
+
+    cleanupSessionState(sessionId);
+    expect(__testInternals.conversationStates.has(
+      deriveConversationKeyFromSessionId(sessionId, "cursor-account-2"),
+    )).toBe(false);
+  });
+
   test("tool-call continuation reuses the live bridge and commits a checkpoint when the turn completes", async () => {
     const runRequests: any[] = [];
     const execClientMessages: any[] = [];
@@ -1702,4 +1786,3 @@ describe("proxy integration — session handling", () => {
   });
 
 });
-

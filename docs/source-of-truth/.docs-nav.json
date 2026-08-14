@@ -1,0 +1,297 @@
+{
+  "schema_version": 1,
+  "docs_root": "source-of-truth",
+  "pages": [
+    {
+      "path": "README.md",
+      "title": "Source of truth",
+      "kind": "root",
+      "links": [
+        "architecture.md",
+        "conflicts.md",
+        "cross-cutting.md",
+        "entrypoints.md",
+        "functions/auth.md",
+        "functions/cursor-shared.md",
+        "functions/index.md",
+        "functions/proxy.md",
+        "modules/auth.md",
+        "modules/cursor-shared.md",
+        "modules/index.md",
+        "modules/proxy.md",
+        "types/auth.md",
+        "types/cursor-shared.md",
+        "types/index.md",
+        "types/proxy.md"
+      ],
+      "source_references": [
+        "scripts/docs_nav.py"
+      ],
+      "backlinks": [],
+      "related": [
+        "architecture.md",
+        "conflicts.md",
+        "cross-cutting.md",
+        "entrypoints.md",
+        "functions/auth.md",
+        "functions/cursor-shared.md",
+        "functions/index.md",
+        "functions/proxy.md",
+        "modules/auth.md",
+        "modules/cursor-shared.md",
+        "modules/index.md",
+        "modules/proxy.md",
+        "types/auth.md",
+        "types/cursor-shared.md",
+        "types/index.md",
+        "types/proxy.md"
+      ]
+    },
+    {
+      "path": "architecture.md",
+      "title": "Architecture",
+      "kind": "root",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md"
+      ]
+    },
+    {
+      "path": "conflicts.md",
+      "title": "Open conflicts and duplicates",
+      "kind": "root",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md"
+      ]
+    },
+    {
+      "path": "cross-cutting.md",
+      "title": "Cross-cutting behavior",
+      "kind": "root",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md"
+      ]
+    },
+    {
+      "path": "entrypoints.md",
+      "title": "Entrypoints",
+      "kind": "root",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md"
+      ]
+    },
+    {
+      "path": "functions/auth.md",
+      "title": "Functions — auth",
+      "kind": "functions",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/auth.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/auth.md"
+      ]
+    },
+    {
+      "path": "functions/cursor-shared.md",
+      "title": "Functions — cursor-shared",
+      "kind": "functions",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/cursor-shared.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/cursor-shared.md"
+      ]
+    },
+    {
+      "path": "functions/index.md",
+      "title": "Functions — index",
+      "kind": "functions",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/index.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/index.md"
+      ]
+    },
+    {
+      "path": "functions/proxy.md",
+      "title": "Functions — proxy",
+      "kind": "functions",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/proxy.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/proxy.md"
+      ]
+    },
+    {
+      "path": "modules/auth.md",
+      "title": "Module — auth",
+      "kind": "modules",
+      "links": [
+        "functions/auth.md",
+        "types/auth.md"
+      ],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md",
+        "functions/auth.md",
+        "types/auth.md"
+      ]
+    },
+    {
+      "path": "modules/cursor-shared.md",
+      "title": "Module — cursor-shared",
+      "kind": "modules",
+      "links": [
+        "functions/cursor-shared.md",
+        "types/cursor-shared.md"
+      ],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md",
+        "functions/cursor-shared.md",
+        "types/cursor-shared.md"
+      ]
+    },
+    {
+      "path": "modules/index.md",
+      "title": "Module — index",
+      "kind": "modules",
+      "links": [
+        "functions/index.md",
+        "types/index.md"
+      ],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md",
+        "functions/index.md",
+        "types/index.md"
+      ]
+    },
+    {
+      "path": "modules/proxy.md",
+      "title": "Module — proxy",
+      "kind": "modules",
+      "links": [
+        "functions/proxy.md",
+        "types/proxy.md"
+      ],
+      "source_references": [],
+      "backlinks": [
+        "README.md"
+      ],
+      "related": [
+        "README.md",
+        "functions/proxy.md",
+        "types/proxy.md"
+      ]
+    },
+    {
+      "path": "types/auth.md",
+      "title": "Types — auth",
+      "kind": "types",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/auth.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/auth.md"
+      ]
+    },
+    {
+      "path": "types/cursor-shared.md",
+      "title": "Types — cursor-shared",
+      "kind": "types",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/cursor-shared.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/cursor-shared.md"
+      ]
+    },
+    {
+      "path": "types/index.md",
+      "title": "Types — index",
+      "kind": "types",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/index.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/index.md"
+      ]
+    },
+    {
+      "path": "types/proxy.md",
+      "title": "Types — proxy",
+      "kind": "types",
+      "links": [],
+      "source_references": [],
+      "backlinks": [
+        "README.md",
+        "modules/proxy.md"
+      ],
+      "related": [
+        "README.md",
+        "modules/proxy.md"
+      ]
+    }
+  ],
+  "external_links": [],
+  "unresolved_links": []
+}
