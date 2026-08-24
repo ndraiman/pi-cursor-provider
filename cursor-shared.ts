@@ -90,7 +90,7 @@ function register(
         const accepted = options.rejectDuplicateLogin
           ? options.rejectDuplicateLogin(providerId, credentials)
           : credentials;
-        const discovered = await getCursorModels(accessToken);
+        const discovered = await getCursorModels(accepted.access);
         if (discovered.length > 0) options.onModelsDiscovered?.(discovered);
         return accepted;
       },

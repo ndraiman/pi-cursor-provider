@@ -507,6 +507,24 @@ describe("Cursor provider slots", () => {
   });
 });
 
+describe("provider path and model cache", () => {
+  test("rejects malformed percent-encoding instead of throwing", () => {
+    expect(__testInternals.decodeProviderPathSegment("%ZZ")).toBeNull();
+    expect(__testInternals.decodeProviderPathSegment("cursor-account-2")).toBe("cursor-account-2");
+  });
+
+  test("bounds the model cache", () => {
+    __testInternals.cachedModels.clear();
+    for (let i = 0; i < __testInternals.MAX_CACHED_MODELS + 5; i++) {
+      __testInternals.rememberCachedModels(`token-${i}`, [m("gpt-5")]);
+    }
+    expect(__testInternals.cachedModels.size).toBe(__testInternals.MAX_CACHED_MODELS);
+    expect(__testInternals.cachedModels.has("token-0")).toBe(false);
+    expect(__testInternals.cachedModels.has(`token-${__testInternals.MAX_CACHED_MODELS + 4}`)).toBe(true);
+    __testInternals.cachedModels.clear();
+  });
+});
+
 describe("session cleanup", () => {
   function seedSessionState(sessionId: string) {
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
@@ -1209,6 +1227,28 @@ describe("proxy integration — session handling", () => {
     expect(__testInternals.conversationStates.has(
       deriveConversationKeyFromSessionId(sessionId, "cursor-account-2"),
     )).toBe(false);
+  });
+
+  test("returns 400 for malformed provider percent-encoding", async () => {
+    const port = await startProxy(async () => "test-token");
+    const response = await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+      const req = httpRequest({
+        hostname: "127.0.0.1",
+        port,
+        path: "/v1/%E0%A4%A/models",
+        method: "GET",
+      }, (res) => {
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { data += chunk; });
+        res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body: data }));
+        res.on("error", reject);
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.body).toContain("Invalid provider path");
   });
 
   test("tool-call continuation reuses the live bridge and commits a checkpoint when the turn completes", async () => {

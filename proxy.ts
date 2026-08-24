@@ -289,9 +289,34 @@ function nextDebugRequestId(): string {
   return `req-${debugRequestCounter}`;
 }
 
+const MAX_CACHED_MODELS = 32;
+const cachedModels = new Map<string, CursorModel[]>();
+
+function rememberCachedModels(apiKey: string, models: CursorModel[]): void {
+  if (cachedModels.has(apiKey)) cachedModels.delete(apiKey);
+  cachedModels.set(apiKey, models);
+  while (cachedModels.size > MAX_CACHED_MODELS) {
+    const oldest = cachedModels.keys().next().value;
+    if (oldest === undefined) break;
+    cachedModels.delete(oldest);
+  }
+}
+
+function decodeProviderPathSegment(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
 export const __testInternals = {
   activeBridges,
   conversationStates,
+  cachedModels,
+  MAX_CACHED_MODELS,
+  rememberCachedModels,
+  decodeProviderPathSegment,
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
@@ -439,11 +464,12 @@ export interface CursorModel {
   maxTokens: number;
 }
 
-const cachedModels = new Map<string, CursorModel[]>();
-
 export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
   const cached = cachedModels.get(apiKey);
-  if (cached) return cached;
+  if (cached) {
+    rememberCachedModels(apiKey, cached);
+    return cached;
+  }
   try {
     const requestPayload = create(GetUsableModelsRequestSchema, {});
     const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
@@ -466,7 +492,7 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
       if (decoded?.models?.length) {
         const models = normalizeCursorModels(decoded.models);
         if (models.length > 0) {
-          cachedModels.set(apiKey, models);
+          rememberCachedModels(apiKey, models);
           return models;
         }
       }
@@ -531,7 +557,16 @@ export async function startProxy(
       debugLog("http.request", { requestId, method: req.method, pathname: url.pathname, headers: req.headers });
 
       const providerMatch = url.pathname.match(/^\/v1\/([^/]+)\/(models|chat\/completions)$/);
-      const providerId = providerMatch?.[1] ? decodeURIComponent(providerMatch[1]) : "cursor";
+      let providerId = "cursor";
+      if (providerMatch?.[1]) {
+        const decoded = decodeProviderPathSegment(providerMatch[1]);
+        if (decoded === null) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Invalid provider path", type: "invalid_request_error" } }));
+          return;
+        }
+        providerId = decoded;
+      }
       const endpoint = providerMatch?.[2] ?? url.pathname.slice("/v1/".length);
 
       if (req.method === "GET" && endpoint === "models" && (url.pathname === "/v1/models" || providerMatch)) {
