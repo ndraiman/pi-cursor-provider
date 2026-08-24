@@ -334,7 +334,7 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
   return result.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function modelConfig(m: ProcessedModel) {
+export function modelConfig(m: ProcessedModel) {
   return {
     id: m.id,
     name: m.name,
@@ -362,6 +362,10 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
 
 // ── Extension ──
 
+export function isCursorProviderId(provider: unknown): boolean {
+  return provider === "cursor" || (typeof provider === "string" && /^cursor-account-\d+$/.test(provider));
+}
+
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
   const cleanupCurrentSession = (_event: unknown, ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } }) => {
     debugExtensionLog("session.cleanup_hook", {
@@ -381,7 +385,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
   if (!isExtensionDebugEnabled()) return;
 
   pi.on("message_start", async (event, ctx) => {
-    if (ctx.model?.provider !== "cursor") return;
+    if (!isCursorProviderId(ctx.model?.provider)) return;
     debugExtensionLog("message.start", {
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
@@ -391,7 +395,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
   });
 
   pi.on("message_update", async (event, ctx) => {
-    if (ctx.model?.provider !== "cursor") return;
+    if (!isCursorProviderId(ctx.model?.provider)) return;
     const typedEvent = event as { message?: unknown; assistantMessageEvent?: Record<string, unknown> };
     debugExtensionLog("message.update", {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -408,7 +412,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event, ctx) => {
-    if (ctx.model?.provider !== "cursor") return;
+    if (!isCursorProviderId(ctx.model?.provider)) return;
     debugExtensionLog("message.end", {
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
@@ -419,7 +423,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event, ctx) => {
-    if (ctx.model?.provider !== "cursor") return;
+    if (!isCursorProviderId(ctx.model?.provider)) return;
     const typedEvent = event as { messages?: unknown[] };
     debugExtensionLog("context", {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -434,7 +438,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (event, ctx) => {
-    if (ctx.model?.provider !== "cursor") return;
+    if (!isCursorProviderId(ctx.model?.provider)) return;
     const typedEvent = event as { turnIndex?: number; message?: unknown; toolResults?: unknown[] };
     debugExtensionLog("turn.end", {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -473,7 +477,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     const payload = event.payload as Record<string, unknown> | undefined;
-    if (payload && ctx.model?.provider === "cursor") {
+    if (payload && isCursorProviderId(ctx.model?.provider)) {
       payload.pi_session_id = ctx.sessionManager.getSessionId();
       debugExtensionLog("before_provider_request", {
         sessionId: ctx.sessionManager.getSessionId(),

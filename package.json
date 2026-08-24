@@ -31,6 +31,7 @@
   },
   "files": [
     "index.ts",
+    "cursor-shared.ts",
     "auth.ts",
     "proxy.ts",
     "h2-bridge.mjs",
